@@ -1,6 +1,7 @@
 from edgar import set_identity, Company
 import datetime as dt
-from ratelimit import limits, sleep_and_retry
+from ratelimit import limits, RateLimitException
+from backoff import on_exception, expo
 from bs4 import BeautifulSoup
 import os
 import argparse
@@ -70,31 +71,34 @@ def ping_healthchecks():
         time.sleep(60)  # Ping every minute
 
 
-def process_ciks(conn, ciks):
-    for cik in ciks:
-        latest_filing = get_latest_filing_using_cik_number(conn, cik)
-        if latest_filing:
-            most_recent_date = latest_filing.filing_date
-            logger.debug(f"Most recent filing date for {cik}: {most_recent_date}")
-            fetch_new_filing(cik, most_recent_date)
-        else:
-            logger.debug(f"No filings found for {cik}. Fetching all available.")
-            fetch_new_filing(cik, dt.datetime(1970, 1, 1))
-
-
-@sleep_and_retry
+@on_exception(expo, RateLimitException, max_tries=8)
 @limits(calls=10, period=1)  # Limit to 10 calls per second
-def fetch_new_filing(cik_number, most_recent_date):
+def fetch_new_filing(conn, cik_number, most_recent_date: dt.date):
     c = Company(cik_number)
+    today_date = dt.date.today().strftime("%Y-%m-%d")
 
     for attempt in range(MAX_RETRIES):
         try:
-            # Fetch filings for the company
-            filings = c.get_filings(sort_by='filing_date', form=VALID_FORMS)
+            # Fetch filings from lastest filing date to today
+            filings = c.get_filings(
+                sort_by='filing_date',
+                form=VALID_FORMS,
+                filing_date=(f"{most_recent_date.strftime('%Y-%m-%d')}:{today_date}"),
+            )
+
+            if not filings:
+                logger.info(
+                    f"No new valid filings found for CIK {cik_number} since {most_recent_date}"
+                )
+                return
 
             for filing in filings:
+                # technically there is no need for this check because
+                # we are fetching only valid forms
                 if filing.form in VALID_FORMS:
                     filing_date = filing.filing_date
+
+                    assert isinstance(filing_date, dt.date)
 
                     if filing_date > most_recent_date:
                         accession_number = filing.accession_number
@@ -156,8 +160,8 @@ def fetch_new_filing(cik_number, most_recent_date):
                             f"Total holdings inserted: {holding_inserted_count}"
                         )
                     else:
-                        logger.debug(
-                            f"No new filings for {cik_number} since {most_recent_date}. "
+                        logger.info(
+                            f"Filing date {filing_date} is not newer than most recent date {most_recent_date} for CIK {cik_number}"
                         )
         except HTTPStatusError as e:
             # Handle HTTP errors, retry on server errors
@@ -165,9 +169,38 @@ def fetch_new_filing(cik_number, most_recent_date):
                 e.response.status_code in [500, 503, 504]
                 and (attempt + 1) < MAX_RETRIES
             ):
+                logger.info(
+                    f"HTTP error {e.response.status_code} for CIK {cik_number}, retrying..."
+                )
                 time.sleep(2 * (attempt + 1))
                 continue
-            raise e
+            logger.error(e)
+
+
+def process_all_ciks(conn, ciks):
+    """Process all CIKs in the list"""
+    processed_count = 0
+    for cik in ciks:
+        try:
+            logger.info(f"Processing CIK: {cik}")
+            latest_filing = get_latest_filing_using_cik_number(conn, cik)
+
+            if latest_filing:
+                logger.info(
+                    f"Most recent filing date for {cik}: {latest_filing.filing_date}"
+                )
+                fetch_new_filing(conn, cik, latest_filing.filing_date)
+            else:
+                logger.info(f"No filings found for {cik}. Fetching all available.")
+                fetch_new_filing(conn, cik, dt.date(1970, 1, 1))
+
+            processed_count += 1
+
+        except Exception as e:
+            logger.error(f"Failed to process CIK {cik}: {str(e)}")
+            continue
+
+    return processed_count
 
 
 if __name__ == "__main__":
@@ -218,15 +251,13 @@ if __name__ == "__main__":
             # Check for changes in the CIK file
             event_handler.check_for_changes()
 
-            for cik in state['current_ciks']:
-                # fetch latest filing from database
-                latest_filing = get_latest_filing_using_cik_number(conn, cik)
+            if state['current_ciks']:
+                logger.info(f"Processing {len(state['current_ciks'])} CIKs")
+                process_all_ciks(conn, state['current_ciks'])
+            else:
+                logger.debug("No CIKs to process, waiting for changes...")
 
-                if latest_filing:  # if there is latest filing, find more recent filing
-                    fetch_new_filing(cik, latest_filing.filing_date)
-                else:  # if no filings, fetch the latest filing
-                    fetch_new_filing(cik, dt.date(1970, 1, 1))
-            logger.debug("Loop completed, sleeping for 3 seconds...")
+            logger.info("Loop completed, sleeping for 3 seconds...")
             time.sleep(3)
     except KeyboardInterrupt:
         logger.info("Shutdown signal received, stopping observer...")
@@ -235,3 +266,4 @@ if __name__ == "__main__":
         observer.join()
 
         state['conn'].close()
+        logger.info("Database connection closed")
