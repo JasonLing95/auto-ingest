@@ -2,415 +2,412 @@ import psycopg2
 from typing import List
 from edgar import Filing as EdgarFiling
 import datetime as dt
+from bs4 import BeautifulSoup
+from psycopg2 import sql
 
-from sec_models import (
-    Filing,
-    Holding,
-    Manager,
-    Issuer,
-    SecurityClass,
-    HoldingType,
-    OptionType,
-    DiscretionType,
-)
 from get_logger import get_logger
 
 logger = get_logger(__name__)
 
 
-def get_latest_filing_using_cik_number(conn, cik: str):
+def get_latest_filing_using_cik_number(conn, cik: str) -> dt.date:
     """Fetch the most recent filing for a given CIK"""
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT 
-                f.filing_id,
-                f.manager_id,
-                f.form_type,
-                f.sec_accession_number,
-                f.filing_date,
-                f.file_number,
-                f.filing_directory,
-                f.reporting_period,
-                f.created_at,
-                f.updated_at
-            FROM filings f
-            JOIN managers m ON f.manager_id = m.manager_id
-            WHERE m.cik_number = %s
-            ORDER BY f.filing_date DESC
-            LIMIT 1
+            SELECT MAX(t1.filing_date)
+            FROM filings AS t1
+            JOIN companies AS t2
+            ON t1.company_id = t2.company_id
+            WHERE t2.cik_number = %s
             """,
-            (cik.zfill(10),),
+            (cik,),
         )
-        result = cur.fetchone()
+        latest_date = cur.fetchone()[0]
 
-        return Filing(*result) if result else None
+    return latest_date
 
 
-def gather_holdings_from_soup(conn, soup) -> List[Holding]:
+def gather_data_with_bs4(data, cik, accession_number) -> list[list]:
+    soup = BeautifulSoup(data, 'xml')
+
+    result = []
+    for row in soup.find_all('infoTable'):
+        name_of_issuer = row.find('nameOfIssuer').text.strip()  # type: ignore
+        issuer_cusip = row.find('cusip').text.strip()  # type: ignore
+
+        share_amount = int(float(row.find('sshPrnamt').text.strip()))  # type: ignore
+
+        share_type = row.find('sshPrnamtType').text.strip().upper()  # type: ignore
+        if share_type not in ['SH', 'PRN']:
+            raise ValueError(f"Invalid share type: {share_type}")  # type: ignore
+
+        value = int(float(row.find('value').text.strip()))  # type: ignore
+
+        investment_discretion = row.find('investmentDiscretion').text.strip().upper()  # type: ignore
+        if investment_discretion not in ['SOLE', 'DFND', 'OTR']:
+            raise ValueError(f"Invalid investment discretion: {investment_discretion}")
+
+        put_call: str = row.find('putCall').text.strip() if row.find('putCall') else "NONE"  # type: ignore
+        if put_call.strip().upper() not in ['NONE', 'PUT', 'CALL']:
+            raise ValueError(f"Invalid put/call type: {put_call}")
+
+        title_of_class = row.find('titleOfClass').text.strip()  # type: ignore
+
+        voting_authority = row.find('votingAuthority')  # type: ignore
+        voting_authority_sole = int(float(voting_authority.find('Sole').text.strip()))  # type: ignore
+        voting_authority_shared = int(
+            float(voting_authority.find('Shared').text.strip())  # type: ignore
+        )
+        voting_authority_none = int(float(voting_authority.find('None').text.strip()))  # type: ignore
+
+        result.append(
+            [
+                cik,
+                accession_number,  # 1
+                share_amount,  # share amount
+                value,  # share value 3
+                title_of_class,  # com etc.
+                share_type,  # share type 5
+                investment_discretion,  # investment discretion
+                put_call,  # mostly none 7
+                voting_authority_sole,  # voting authority (sole)
+                voting_authority_shared,  # voting authority (shared) 9
+                voting_authority_none,  # voting authority (none)
+                name_of_issuer,  # issuer name 11
+                issuer_cusip,  # cusip
+            ]
+        )
+
+    return result
+
+
+def gather_holdings_using_lxml(tables, ns, cik, accession_number) -> List[list]:
     """Parse XML soup and return list of Holding objects"""
     holdings = []
 
-    for row in soup.find_all('infoTable'):
-        # Extract basic data
-        name_of_issuer = row.find('nameOfIssuer').text.strip()
-        cusip = row.find('cusip').text.strip()
-        title_of_class = row.find('titleOfClass').text.strip()
-
-        # Convert numerical values
-        try:
-            value = int(float(row.find('value').text.strip()))
-            shares_amount = int(float(row.find('sshPrnamt').text.strip()))
-        except (ValueError, AttributeError) as e:
-            raise ValueError(f"Invalid numerical value in holding data: {e}")
-
-        # Extract enums with validation
-        share_type = row.find('sshPrnamtType').text.strip().upper()
-        if share_type not in ('SH', 'PRN'):
+    for table in tables:
+        # name of issuer
+        name_of_issuer = table.xpath('string(ns:nameOfIssuer)', namespaces=ns).strip()
+        # CUSIP
+        cusip = table.xpath('string(ns:cusip)', namespaces=ns).strip()
+        # common stock (COM) or etc.
+        title_of_class = table.xpath('string(ns:titleOfClass)', namespaces=ns).strip()
+        # stock value
+        value = int(float(table.xpath('string(ns:value)', namespaces=ns).strip()))
+        # stock amount
+        shares_amount = int(
+            float(
+                table.xpath(
+                    'string(ns:shrsOrPrnAmt/ns:sshPrnamt)', namespaces=ns
+                ).strip()
+                or 0
+            )
+        )
+        # share type SH / PRN
+        share_type = (
+            table.xpath('string(ns:shrsOrPrnAmt/ns:sshPrnamtType)', namespaces=ns)
+            .strip()
+            .upper()
+        )
+        if share_type not in ['SH', 'PRN']:
             raise ValueError(f"Invalid share type: {share_type}")
 
-        investment_discretion = row.find('investmentDiscretion').text.strip().upper()
-        if investment_discretion not in ('SOLE', 'DFND', 'OTR'):
+        # DFND etc.
+        investment_discretion = (
+            table.xpath('string(ns:investmentDiscretion)', namespaces=ns)
+            .strip()
+            .upper()
+        )
+        if investment_discretion not in ['SOLE', 'DFND', 'OTR']:
             raise ValueError(f"Invalid investment discretion: {investment_discretion}")
 
-        put_call = row.find('putCall')
-        put_call = put_call.text.strip().upper() if put_call else "NONE"
+        # often blank
+        put_call = (
+            table.xpath('string(ns:putCall)', namespaces=ns).strip().upper() or "NONE"
+        )
+        if put_call not in ['NONE', 'PUT', 'CALL']:
+            raise ValueError(f"Invalid put/call type: {put_call}")
 
-        # Extract voting authority
-        voting = row.find('votingAuthority')
-        try:
-            sole = int(voting.find('Sole').text.strip()) if voting else 0
-            shared = int(voting.find('Shared').text.strip()) if voting else 0
-            none = int(voting.find('None').text.strip()) if voting else 0
-        except (AttributeError, ValueError):
-            sole = shared = none = 0
-
-        security = get_or_create_security_class(conn, title_of_class)
-        holding_type = get_or_create_holding_type(conn, share_type)
-        option = get_or_create_option_type(conn, put_call)
-        discretion = get_or_create_discretion_type(conn, investment_discretion)
-
-        # Create Holding instance
-        holding = Holding(
-            shares_or_principal_amount=shares_amount,
-            value=value,
-            title_of_class_id=security.id,
-            shares_or_principal_type_id=holding_type.id,
-            put_or_call_id=option.id,
-            investment_discretion_id=discretion.id,
-            voting_authority_sole=sole,
-            voting_authority_shared=shared,
-            voting_authority_none=none,
-            # Additional metadata
-            _issuer_name=name_of_issuer,
-            _issuer_cusip=cusip,
+        # voting authority - sole
+        sole = (
+            int(
+                float(
+                    table.xpath(
+                        'string(ns:votingAuthority/ns:Sole)', namespaces=ns
+                    ).strip()
+                )
+            )
+            or 0
+        )
+        # voting authority - shared
+        shared = (
+            int(
+                float(
+                    table.xpath(
+                        'string(ns:votingAuthority/ns:Shared)', namespaces=ns
+                    ).strip()
+                )
+            )
+            or 0
+        )
+        # voting authority - none
+        none = (
+            int(
+                float(
+                    table.xpath(
+                        'string(ns:votingAuthority/ns:None)', namespaces=ns
+                    ).strip()
+                )
+            )
+            or 0
         )
 
-        holdings.append(holding)
+        holdings.append(
+            [
+                cik,
+                accession_number,
+                shares_amount,
+                value,
+                title_of_class,
+                share_type,
+                investment_discretion,
+                put_call,
+                sole,
+                shared,
+                none,
+                name_of_issuer,
+                cusip,
+            ]
+        )
 
     return holdings
 
 
-def insert_filing(conn, manager_id: int, filing: EdgarFiling) -> int:
-    try:
-        with conn.cursor() as cur:
-            if not isinstance(filing.filing_date, dt.date):
-                raise ValueError("filing_date must be a datetime object")
+def insert_filing(
+    conn: psycopg2.extensions.connection, cik: str, filing: EdgarFiling
+) -> int:
+    accession_number = filing.accession_number
 
-            # Insert the filing
+    try:
+        filing_date = filing.filing_date.isoformat()  # type: ignore
+    except ArithmeticError:
+        filing_date = None
+
+    try:
+        period_of_report = filing.period_of_report  # in str format
+    except ArithmeticError:
+        period_of_report = None
+
+    filing_form_type = filing.form
+
+    try:
+        file_number = filing.file_number  # type: ignore
+    except AttributeError:
+        file_number = None
+
+    try:
+        file_dir = filing.filing_directory.name
+    except ArithmeticError:
+        file_dir = None
+
+    try:
+        # Get company_id from database
+        with conn.cursor() as cur:
             cur.execute(
-                """
+                "SELECT company_id FROM companies WHERE cik_number = %s", (cik,)
+            )
+            company_id_result = cur.fetchone()
+
+            if not company_id_result:
+                logger.info(f"Error: Company with CIK {cik} not found.")
+                # this should raise an error because technically the CIK should exist
+
+                raise ValueError(f"Company with CIK {cik} not found.")
+
+            company_id = company_id_result[0]
+
+            # Step 2: Prepare the INSERT query with psycopg2-style placeholders.
+            query = """
                 INSERT INTO filings (
-                    manager_id,
-                    form_type,
-                    sec_accession_number,
-                    filing_date,
-                    file_number,
-                    filing_directory,
-                    reporting_period
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    company_id, form_type, accession_number,
+                    filing_date, file_number, filing_directory,
+                    period_of_report, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING filing_id
-                """,
-                (
-                    manager_id,
-                    filing.form,
-                    filing.accession_number,
-                    filing.filing_date.isoformat(),
-                    filing.file_number if hasattr(filing, 'file_number') else None,  # type: ignore
-                    filing.filing_directory.name,
-                    filing.period_of_report,
-                ),
+            """
+
+            # Step 3: Prepare the parameters as a tuple.
+            params = (
+                company_id,
+                filing_form_type,
+                accession_number,
+                filing_date,
+                file_number,
+                file_dir,
+                period_of_report,
+                dt.datetime.now(),
+                dt.datetime.now(),
             )
 
-            filing_id = cur.fetchone()[0]
+            # Step 4: Execute the query within a cursor block.
+            cur.execute(query, params)
+            new_filing_id = cur.fetchone()[0]  # type: ignore
+
+            # Step 5: Commit the transaction.
             conn.commit()
+
             logger.info(
-                f"Inserted filing with ID: {filing_id} for manager ID: {manager_id}"
+                f"✅ Successfully inserted filing {accession_number} with ID {new_filing_id}"
             )
-            return filing_id
+
+            return new_filing_id
 
     except psycopg2.Error as e:
+        logger.error(f"PostgreSQL Error: {e}")
         conn.rollback()
-        raise psycopg2.Error(f"Failed to insert filing: {e}")
+
+        raise Exception(f"Error inserting filing {accession_number}: {str(e)}")
 
 
-def get_manager_by_cik(conn, cik_number):
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT 
-                    manager_id,
-                    cik_number,
-                    manager_name,
-                    manager_business_address,
-                    manager_mailing_address,
-                    manager_phone,
-                    created_at,
-                    updated_at
-                FROM managers
-                WHERE cik_number = %s
-                """,
-                (cik_number.zfill(10),),
-            )
+def get_or_create_id(
+    cur,
+    table_name: str,
+    value: str,
+    column_name: str = 'name',
+    pk_column_name: str = 'id',
+) -> int:
+    """
+    Retrieves the ID for a given value from a lookup table.
+    If the value does not exist, it inserts it and returns the new ID.
 
-            result = cur.fetchone()
-            if not result:
-                return None
+    Args:
+        cur: The psycopg2 cursor object.
+        table_name (str): The name of the lookup table.
+        value (str): The value to look up or insert.
+        column_name (str): The name of the column to query. Defaults to 'name'.
 
-            return Manager(*result)
+    Returns:
+        int: The ID of the existing or newly created record.
+    """
+    # Check for the existing value
+    check_query = sql.SQL("SELECT {pk_column} FROM {table} WHERE {column} = %s").format(
+        pk_column=sql.Identifier(pk_column_name),
+        table=sql.Identifier(table_name),
+        column=sql.Identifier(column_name),
+    )
+    cur.execute(check_query, (value,))
+    result = cur.fetchone()
 
-    except psycopg2.Error as e:
-        raise psycopg2.Error(f"Database error fetching manager: {e}")
+    if result:
+        return result[0]
 
-
-def get_or_create_issuer(conn, cusip: str, issuer_name: str) -> Issuer:
-    """Get issuer by CUSIP if exists"""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO issuers (cusip, issuer_name)
-            VALUES (%s, %s)
-            ON CONFLICT (cusip) DO UPDATE
-            SET issuer_name = EXCLUDED.issuer_name,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING issuer_id, cusip, issuer_name, created_at, updated_at
-            """,
-            (cusip, issuer_name),
-        )
-        result = cur.fetchone()
-        return Issuer(*result)
+    # If not found, insert the new value and return its ID
+    insert_query = sql.SQL(
+        "INSERT INTO {table} ({column}) VALUES (%s) RETURNING {pk_column}"
+    ).format(
+        table=sql.Identifier(table_name),
+        column=sql.Identifier(column_name),
+        pk_column=sql.Identifier(pk_column_name),
+    )
+    cur.execute(insert_query, (value,))
+    return cur.fetchone()[0]
 
 
-def get_or_create_security_class(conn, class_name: str) -> SecurityClass:
-    """Get or create a security class (e.g., 'COM', 'PUT')"""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO security_classes (name)
-            VALUES (%s)
-            ON CONFLICT (name) DO UPDATE
-            SET name = EXCLUDED.name
-            RETURNING id, name
-            """,
-            (class_name,),
-        )
-        result = cur.fetchone()
-
-        return SecurityClass(*result)
-
-
-def get_or_create_holding_type(conn, type_code: str) -> HoldingType:
-    """Get or create a holding type ('SH' or 'PRN')"""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO holding_types (code)
-            VALUES (%s)
-            ON CONFLICT (code) DO UPDATE
-            SET code = EXCLUDED.code
-            RETURNING id, code
-            """,
-            (type_code,),
-        )
-        result = cur.fetchone()
-        return HoldingType(*result)
-
-
-def get_or_create_option_type(conn, option_name: str) -> OptionType:
-    """Get or create an option type ('PUT', 'CALL', 'NONE')"""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO option_types (name)
-            VALUES (%s)
-            ON CONFLICT (name) DO UPDATE
-            SET name = EXCLUDED.name
-            RETURNING id, name
-            """,
-            (option_name,),
-        )
-        result = cur.fetchone()
-        return OptionType(*result)
-
-
-def get_or_create_discretion_type(conn, discretion_code: str) -> DiscretionType:
-    """Get or create investment discretion type ('SOLE', 'DFND', 'OTR')"""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO discretion_types (code)
-            VALUES (%s)
-            ON CONFLICT (code) DO UPDATE
-            SET code = EXCLUDED.code
-            RETURNING id, code
-            """,
-            (discretion_code,),
-        )
-        result = cur.fetchone()
-        return DiscretionType(*result)
-
-
-def insert_holdings_batch(conn, holdings: list[Holding]) -> None:
+def insert_holdings_batch(
+    conn: psycopg2.extensions.connection,
+    holdings: list[list],
+    filing_id: int,
+    chunk_size: int = 50000,
+) -> None:
     """
     Insert multiple holdings in a single batch operation.
     """
-    try:
-        with conn.cursor() as cur:
-            # Create a list of tuples with all values
-            values = [
-                (
-                    h.filing_id,
-                    h.issuer_id,
-                    h.title_of_class_id,
-                    h.shares_or_principal_amount,
-                    h.shares_or_principal_type_id,
-                    h.value,
-                    h.put_or_call_id,
-                    h.investment_discretion_id,
-                    h.voting_authority_sole or 0,
-                    h.voting_authority_shared or 0,
-                    h.voting_authority_none or 0,
+    total_inserted = 0
+
+    with conn.cursor() as cur:
+        # Loop through chunks of holdings
+        for i in range(0, len(holdings), chunk_size):
+            chunk = holdings[i : i + chunk_size]
+
+            # Prepare a list to hold the tuples for insertion
+            insert_tuples = []
+
+            try:
+                # Process each holding in the chunk
+                for holding in chunk:
+                    # Get or create IDs for foreign key relationships
+                    issuer_id = get_or_create_id(
+                        cur,
+                        'issuers',
+                        holding[11],
+                        'issuer_name',
+                        "issuer_id",
+                    )
+                    title_of_class_id = get_or_create_id(
+                        cur, 'title_of_class_table', holding[4]
+                    )
+                    shares_or_principal_type_id = get_or_create_id(
+                        cur, 'share_type_table', holding[5]
+                    )
+                    put_or_call_id = get_or_create_id(
+                        cur, 'put_or_call_table', holding[7]
+                    )
+                    investment_discretion_id = get_or_create_id(
+                        cur,
+                        'investment_discretion_table',
+                        holding[6],
+                    )
+
+                    # Create the tuple for this holding
+                    holding_tuple = (
+                        filing_id,
+                        issuer_id,
+                        title_of_class_id,
+                        holding[2],
+                        shares_or_principal_type_id,
+                        holding[3],
+                        put_or_call_id,
+                        investment_discretion_id,
+                        holding[8],
+                        holding[9],
+                        holding[10],
+                    )
+                    insert_tuples.append(holding_tuple)
+
+                # Use executemany for efficient batch insertion
+                query = """
+                    INSERT INTO holdings (
+                        filing_id, issuer_id, title_of_class, shares_or_principal_amount,
+                        shares_or_principal_type, value, put_or_call, investment_discretion,
+                        voting_authority_sole, voting_authority_shared, voting_authority_none
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                cur.executemany(query, insert_tuples)
+                conn.commit()
+                total_inserted += len(chunk)
+                logger.info(
+                    f"✅ Inserted chunk of {len(chunk)} holdings (total: {total_inserted})"
                 )
-                for h in holdings
-            ]
 
-            # Use execute_values for batch insert
-            from psycopg2.extras import execute_values
-
-            execute_values(
-                cur,
-                """
-                INSERT INTO holdings (
-                    filing_id, issuer_id, title_of_class, 
-                    shares_or_principal_amount, shares_or_principal_type,
-                    value, put_or_call, investment_discretion,
-                    voting_authority_sole, voting_authority_shared, voting_authority_none
-                ) VALUES %s
-                RETURNING holding_id
-                """,
-                values,
-                page_size=5000,  # Adjust based on your needs
-            )
-            conn.commit()
-
-    except psycopg2.Error as e:
-        conn.rollback()
-        raise psycopg2.Error(f"Failed to insert holdings: {e}")
-
-
-def insert_holding(conn, holding: Holding) -> int:
-    """
-    Insert a single holding into the database. This function is too slow!
-    """
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO holdings (
-                    filing_id,
-                    issuer_id,
-                    title_of_class,
-                    shares_or_principal_amount,
-                    shares_or_principal_type,
-                    value,
-                    put_or_call,
-                    investment_discretion,
-                    voting_authority_sole,
-                    voting_authority_shared,
-                    voting_authority_none
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING holding_id
-                """,
-                (
-                    holding.filing_id,
-                    holding.issuer_id,
-                    holding.title_of_class_id,
-                    holding.shares_or_principal_amount,
-                    holding.shares_or_principal_type_id,
-                    holding.value,
-                    holding.put_or_call_id,
-                    holding.investment_discretion_id,
-                    holding.voting_authority_sole or 0,
-                    holding.voting_authority_shared or 0,
-                    holding.voting_authority_none or 0,
-                ),
-            )
-            holding_id = cur.fetchone()[0]
-            conn.commit()
-            return holding_id
-
-    except psycopg2.Error as e:
-        conn.rollback()
-        raise psycopg2.Error(f"Failed to insert holding: {e}")
-
-
-def connect_db(
-    db_host="localhost",
-    db_port="5432",
-    db_user="postgres",
-    db_password="",
-    db_name="sec",
-) -> psycopg2.extensions.connection:
-
-    try:
-        logger.info(
-            f"Database parameters: Host {db_host}, Port {db_port}, User {db_user}, Database {db_name}"
-        )
-        conn = psycopg2.connect(
-            host=db_host,
-            port=db_port,
-            user=db_user,
-            password=db_password,
-            database=db_name,
-        )
-        logger.info("Database connection successful")  # Temporary debug
-
-        return conn
-    except Exception as e:
-        raise Exception(f"Database connection failed: {e}")
+            except psycopg2.Error as e:
+                logger.error(f"❌ Failed to insert chunk starting at index {i}: {e}")
+                conn.rollback()
+                break  # Stop processing if an error occurs
 
 
 def filing_exists(conn, accession_number) -> bool:
     """
     Check if a filing with the given SEC accession number already exists in the database
     """
-    try:
-        with conn.cursor() as cur:
-            # Check if filing exists and return its ID
-            cur.execute(
-                """
-                SELECT filing_id FROM filings 
-                WHERE sec_accession_number = %s
-                """,
-                (accession_number,),
-            )
-            result = cur.fetchone()
+    with conn.cursor() as cur:
+        # The query uses %s as a placeholder for the accession number
+        cur.execute(
+            "SELECT EXISTS(SELECT 1 FROM filings WHERE accession_number = %s)",
+            (accession_number,),
+        )
+        # Fetch the result, which will be a single row with one column (True or False)
+        result = cur.fetchone()
 
-            if result:
-                return True  # Filing exists, return filing_id
-            return False
-
-    except Exception as e:
-        logger.error(f"Error checking if filing exists: {e}")
-        return False
+    # Return the boolean value from the query result.
+    return result[0] if result else False

@@ -2,27 +2,23 @@ from edgar import set_identity, Company
 import datetime as dt
 from ratelimit import limits, RateLimitException
 from backoff import on_exception, expo
-from bs4 import BeautifulSoup
+from collections import deque
 import os
 import argparse
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-import hashlib
-from pathlib import Path
 import time
 import requests
 from threading import Thread
 from httpx import HTTPStatusError
+from lxml import etree  # type: ignore
+import psycopg2
 
 from utils import (
     get_latest_filing_using_cik_number,
     insert_filing,
-    get_manager_by_cik,
-    get_or_create_issuer,
     insert_holdings_batch,
-    gather_holdings_from_soup,
-    connect_db,
+    gather_holdings_using_lxml,
     filing_exists,
+    gather_data_with_bs4,
 )
 from get_logger import get_logger
 
@@ -30,38 +26,31 @@ from get_logger import get_logger
 logger = get_logger(__name__)
 
 # User Agent
-set_identity(os.getenv("SEC_IDENTITY", "example2.company@access.com"))
+set_identity(os.getenv("SEC_IDENTITY", "example121.company@access.com"))
 
 HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "https://example.com/healthcheck")
 MAX_RETRIES = 3
-VALID_FORMS = ["13F-HR", "13F-HR/A"]  # Valid forms to fetch filings for
+VALID_FORMS = ["13F-HR", "13F-HR/A", "13F-HR/A/A"]  # Valid forms to fetch filings for
+DUCKDB_PATH = os.getenv("DUCKDB_PATH", "edgar_db.db")
 
 
-class CikFileHandler(FileSystemEventHandler):
-    """Handler to watch for changes in the CIK file."""
-
-    def __init__(self, callback, cik_file_path):
-        self.callback = callback
-        self.cik_file_path = cik_file_path
-        self.last_hash = self.get_file_hash()
-        self.last_mtime = 0
-
-    def check_for_changes(self):
-        current_mtime = os.path.getmtime(self.cik_file_path)
-        if current_mtime > self.last_mtime:
-            self.last_mtime = current_mtime
-            current_hash = self.get_file_hash()
-            if current_hash != self.last_hash:
-                self.last_hash = current_hash
-                self.callback()
-                logger.info("CIK file modified - reloading CIKs")
-
-    def get_file_hash(self):
-        with open(self.cik_file_path, 'rb') as f:
-            return hashlib.md5(f.read()).hexdigest()
+def connect_db() -> psycopg2.extensions.connection:
+    """Connect to PostgreSQL database using environment variables."""
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv('DB_HOST', "localhost"),
+            database=os.getenv('DB_NAME', "sec"),
+            user=os.getenv('DB_USER', "postgres"),
+            password=os.getenv('DB_PASSWORD'),
+            port=os.getenv('DB_PORT', 5432),
+        )
+        print("Connected to PostgreSQL database successfully.")
+        return conn
+    except psycopg2.OperationalError as e:
+        raise Exception(f"Error connecting to PostgreSQL database: {str(e)}")
 
 
-def ping_healthchecks():
+def ping_healthchecks() -> None:
     """Ping the healthcheck URL every minute."""
     while True:
         try:
@@ -71,20 +60,49 @@ def ping_healthchecks():
         time.sleep(60)  # Ping every minute
 
 
+def find_namespaces(tree):
+    """Find all unique namespaces in the XML tree."""
+    all_elements = tree.xpath('//*')
+    unique_prefixes = set()
+    for elem in all_elements:
+        if elem.prefix:
+            unique_prefixes.add(elem.prefix)
+
+    return list(unique_prefixes)
+
+
 @on_exception(expo, RateLimitException, max_tries=8)
 @limits(calls=10, period=1)  # Limit to 10 calls per second
-def fetch_new_filing(conn, cik_number, most_recent_date: dt.date):
+def fetch_new_filing(
+    conn,
+    cik_number,
+    most_recent_date: dt.date,
+):
+    """
+    Fetch new filings for a given CIK number since the most recent date in the database.
+    1. Fetch filings from SEC Edgar using edgar package.
+    2. For each filing, check if it exists in the database. If not, insert it.
+    3. For each filing, parse XML attachments to extract holdings and insert them into the database.
+    4. Handle HTTP errors with retries.
+    """
     c = Company(cik_number)
     today_date = dt.date.today().strftime("%Y-%m-%d")
 
     for attempt in range(MAX_RETRIES):
         try:
-            # Fetch filings from lastest filing date to today
+            logger.info(
+                f"filing_date: {most_recent_date.strftime('%Y-%m-%d')}:{today_date}"
+            )
+            # Fetch filings from (equal or greater than) lastest filing date to today
             filings = c.get_filings(
                 sort_by='filing_date',
                 form=VALID_FORMS,
-                filing_date=(f"{most_recent_date.strftime('%Y-%m-%d')}:{today_date}"),
+                filing_date=(
+                    f"{most_recent_date.strftime('%Y-%m-%d')}:{today_date}"
+                ),  # this is fetching from most recent date to today's date
             )
+
+            logger.info(f"Fetched {len(filings)} filings for CIK {cik_number}")
 
             if not filings:
                 logger.info(
@@ -93,76 +111,71 @@ def fetch_new_filing(conn, cik_number, most_recent_date: dt.date):
                 return
 
             for filing in filings:
-                # technically there is no need for this check because
-                # we are fetching only valid forms
-                if filing.form in VALID_FORMS:
-                    filing_date = filing.filing_date
+                filing_date = filing.filing_date
+                accession_number = filing.accession_number
 
-                    assert isinstance(filing_date, dt.date)
+                # check if filing in database
+                if filing_exists(conn, accession_number):
+                    logger.info(
+                        f"Filing {accession_number} already exists in database, skipping."
+                    )
+                    continue
 
-                    if filing_date > most_recent_date:
-                        accession_number = filing.accession_number
+                new_filing_id = insert_filing(conn, cik_number, filing)
 
-                        # Check if the filing already exists in the database
-                        if filing_exists(conn, accession_number):
-                            continue
+                # insert holdings
+                # Looping through attachments to find XML files
+                for attachment in filing.attachments:
+                    if (
+                        attachment.document.endswith('.xml')
+                        and 'primary_doc' not in attachment.document
+                    ):
+                        logger.info(f"Processing XML attachment: {attachment.url}")
+                        assert attachment.content
 
-                        # this should exist in database because
-                        # we are fetching CIKs that we know
-                        manager = get_manager_by_cik(conn, cik_number)
-                        if not manager:
-                            logger.error("Manager not found for CIK: %s", cik_number)
-                            continue
+                        if isinstance(attachment.content, str):
+                            # Convert string to bytes
+                            xml_content = attachment.content.encode('utf-8')
+                        else:
+                            xml_content = attachment.content
 
-                        manager_id = manager.manager_id
-                        new_filing_id = insert_filing(conn, manager_id, filing)
-                        holding_inserted_count = 0
-
-                        # insert holdings
-                        # Looping through attachments to find XML files
-                        for attachment in filing.attachments:
-                            if (
-                                attachment.document.endswith('.xml')
-                                and 'primary_doc' not in attachment.document
-                            ):
-                                assert attachment.content
-
-                                soup = BeautifulSoup(attachment.content, 'xml')
-                                holdings = []
-
-                                for holding in gather_holdings_from_soup(conn, soup):
-
-                                    assert (
-                                        holding._issuer_cusip
-                                    ), "CUSIP is required for each holding"
-                                    assert (
-                                        holding._issuer_name
-                                    ), "Issuer name is required for each holding"
-
-                                    issuer = get_or_create_issuer(
-                                        conn,
-                                        holding._issuer_cusip,
-                                        holding._issuer_name,
+                        try:
+                            tree = etree.fromstring(xml_content)
+                            nsmap = tree.nsmap
+                            ns = {
+                                'ns': (
+                                    nsmap[None]
+                                    if None in nsmap
+                                    else (
+                                        nsmap['ns1']
+                                        if "ns1" in nsmap
+                                        else nsmap[find_namespaces(tree)[0]]
                                     )
+                                )
+                            }
+                            info_tables = tree.xpath('//ns:infoTable', namespaces=ns)
+                            raw_holdings = gather_holdings_using_lxml(
+                                info_tables,
+                                ns,
+                                cik_number,
+                                accession_number,
+                            )
+                        except:
+                            # try parsing with BeautifulSoup
+                            raw_holdings = gather_data_with_bs4(
+                                attachment.content,
+                                cik_number,
+                                accession_number,
+                            )
 
-                                    holding.issuer_id = issuer.issuer_id
-                                    holding.filing_id = new_filing_id
-                                    holdings.append(holding)
+                        if raw_holdings:
+                            insert_holdings_batch(conn, raw_holdings, new_filing_id)
+            else:
+                logger.info(
+                    f"Filing date {filing_date} is not newer than most recent date {most_recent_date} for CIK {cik_number}"
+                )
 
-                                    # insert_holding(conn, holding)
-                                    holding_inserted_count += 1
-
-                                if holdings:
-                                    insert_holdings_batch(conn, holdings)
-
-                        logger.info(
-                            f"Inserted filling_id {new_filing_id} for {cik_number}. "
-                            f"Total holdings inserted: {holding_inserted_count}"
-                        )
-                    else:
-                        logger.info(
-                            f"Filing date {filing_date} is not newer than most recent date {most_recent_date} for CIK {cik_number}"
-                        )
+            return
         except HTTPStatusError as e:
             # Handle HTTP errors, retry on server errors
             if (
@@ -175,39 +188,55 @@ def fetch_new_filing(conn, cik_number, most_recent_date: dt.date):
                 time.sleep(2 * (attempt + 1))
                 continue
             logger.error(e)
+        except Exception as e:
+            # should raise any other error outside of HTTP errors
+            raise Exception(f"Error fetching filings for CIK {cik_number}: {str(e)}")
 
 
-def process_all_ciks(conn, ciks):
-    """Process all CIKs in the list"""
-    processed_count = 0
-    for cik in ciks:
+def main(conn, cik_queue):
+    """Main processing loop for a list of CIKs."""
+    logger.info(f"Processing {len(cik_queue)} CIKs")
+
+    while True:
+        if not cik_queue:
+            logger.info("CIK queue is empty. Sleeping for 3 seconds...")
+            time.sleep(3)
+            continue
+
+        cik = cik_queue.popleft()
+
         try:
             logger.info(f"Processing CIK: {cik}")
-            latest_filing = get_latest_filing_using_cik_number(conn, cik)
+            latest_filing_date_in_db: dt.date = get_latest_filing_using_cik_number(
+                conn, cik
+            )
 
-            if latest_filing:
+            if latest_filing_date_in_db:
                 logger.info(
-                    f"Most recent filing date for {cik}: {latest_filing.filing_date}"
+                    f"Most recent filing date for {cik}: {latest_filing_date_in_db}"
                 )
-                fetch_new_filing(conn, cik, latest_filing.filing_date)
+                fetch_new_filing(conn, cik, latest_filing_date_in_db)
             else:
                 logger.info(f"No filings found for {cik}. Fetching all available.")
                 fetch_new_filing(conn, cik, dt.date(1970, 1, 1))
 
-            processed_count += 1
+            cik_queue.append(cik)
 
         except Exception as e:
             logger.error(f"Failed to process CIK {cik}: {str(e)}")
-            continue
-
-    return processed_count
+            # If a CIK fails, add it back to the queue to retry later
+            cik_queue.append(cik)
 
 
 if __name__ == "__main__":
+    # connect to database
+    conn = connect_db()
+
     # Start healthcheck thread
     health_thread = Thread(target=ping_healthchecks, daemon=True)
     health_thread.start()
 
+    # Parse command line arguments
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--cik', default=os.getenv('CIK_FILE', "ciks.txt"), help="Path to CIK file"
@@ -215,55 +244,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     logger.info(f"Reading: {args.cik}")
-    with open(args.cik, "r") as f:
-        ciks = f.read().splitlines()
 
-    # connect to the database
-    conn = connect_db(
-        db_host=os.getenv("DB_HOST", "localhost"),
-        db_port=os.getenv("DB_PORT", "5432"),
-        db_user=os.getenv("DB_USER", "postgres"),
-        db_password=os.getenv("DB_PASSWORD", ""),
-        db_name=os.getenv("DB_NAME", "sec"),
-    )
-
-    state = {'current_ciks': [], 'conn': conn}
-
-    # Function to reload CIKs from the file
-    def reload_ciks():
-        with open(args.cik, "r") as f:
-            state['current_ciks'] = [line.strip() for line in f if line.strip()]
-        logger.info(f"Reloaded {len(state['current_ciks'])} CIKs")
-
-    # Initial load
-    reload_ciks()
-
-    # Set up file watcher
-    event_handler = CikFileHandler(reload_ciks, args.cik)
-    observer = Observer()
-    watch_path = str(Path(args.cik).parent)
-    logger.info(f"Watching for changes in {watch_path}")
-    observer.schedule(event_handler, path=watch_path)
-    observer.start()
-
+    # Read CIKs from file
     try:
-        while True:
-            # Check for changes in the CIK file
-            event_handler.check_for_changes()
+        with open(args.cik, "r") as f:
+            ciks = f.read().splitlines()
+        logger.info(f"Loaded {len(ciks)} CIKs")
+    except FileNotFoundError:
+        logger.critical(f"CIK file not found at {args.cik}. Exiting.")
+        exit(1)
 
-            if state['current_ciks']:
-                logger.info(f"Processing {len(state['current_ciks'])} CIKs")
-                process_all_ciks(conn, state['current_ciks'])
-            else:
-                logger.debug("No CIKs to process, waiting for changes...")
-
-            logger.info("Loop completed, sleeping for 3 seconds...")
-            time.sleep(3)
-    except KeyboardInterrupt:
-        logger.info("Shutdown signal received, stopping observer...")
-    finally:
-        observer.stop()
-        observer.join()
-
-        state['conn'].close()
-        logger.info("Database connection closed")
+    # Loop through CIKs and process filings
+    cik_queue = deque(ciks)
+    main(conn, cik_queue)
