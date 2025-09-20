@@ -11,6 +11,7 @@ from threading import Thread
 from httpx import HTTPStatusError
 from lxml import etree  # type: ignore
 import psycopg2
+import sys
 
 from utils import (
     get_latest_filing_using_cik_number,
@@ -46,8 +47,15 @@ def connect_db() -> psycopg2.extensions.connection:
         )
         print("Connected to PostgreSQL database successfully.")
         return conn
+    # Catch the critical database connection error
     except psycopg2.OperationalError as e:
-        raise Exception(f"Error connecting to PostgreSQL database: {str(e)}")
+        logger.critical(f"Database connection error: {e}. Shutting down.")
+        sys.exit(1)  # Exit with an error code
+
+    # Catch any other unexpected, fatal errors
+    except Exception as e:
+        logger.critical(f"An unrecoverable error occurred: {e}. Shutting down.")
+        sys.exit(1)  # Exit with an error code
 
 
 def ping_healthchecks() -> None:
