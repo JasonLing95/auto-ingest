@@ -39,11 +39,11 @@ def connect_db() -> psycopg2.extensions.connection:
     """Connect to PostgreSQL database using environment variables."""
     try:
         conn = psycopg2.connect(
-            host=os.getenv('DB_HOST', "localhost"),
-            database=os.getenv('DB_NAME', "sec"),
-            user=os.getenv('DB_USER', "postgres"),
-            password=os.getenv('DB_PASSWORD'),
-            port=os.getenv('DB_PORT', 5432),
+            host=os.getenv("DB_HOST", "localhost"),
+            database=os.getenv("DB_NAME", "sec"),
+            user=os.getenv("DB_USER", "postgres"),
+            password=os.getenv("DB_PASSWORD"),
+            port=os.getenv("DB_PORT", 5432),
         )
         print("Connected to PostgreSQL database successfully.")
         return conn
@@ -70,7 +70,7 @@ def ping_healthchecks() -> None:
 
 def find_namespaces(tree):
     """Find all unique namespaces in the XML tree."""
-    all_elements = tree.xpath('//*')
+    all_elements = tree.xpath("//*")
     unique_prefixes = set()
     for elem in all_elements:
         if elem.prefix:
@@ -103,7 +103,7 @@ def fetch_new_filing(
             )
             # Fetch filings from (equal or greater than) lastest filing date to today
             filings = c.get_filings(
-                sort_by='filing_date',
+                sort_by="filing_date",
                 form=VALID_FORMS,
                 filing_date=(
                     f"{most_recent_date.strftime('%Y-%m-%d')}:{today_date}"
@@ -135,15 +135,15 @@ def fetch_new_filing(
                 # Looping through attachments to find XML files
                 for attachment in filing.attachments:
                     if (
-                        attachment.document.endswith('.xml')
-                        and 'primary_doc' not in attachment.document
+                        attachment.document.endswith(".xml")
+                        and "primary_doc" not in attachment.document
                     ):
                         logger.info(f"Processing XML attachment: {attachment.url}")
                         assert attachment.content
 
                         if isinstance(attachment.content, str):
                             # Convert string to bytes
-                            xml_content = attachment.content.encode('utf-8')
+                            xml_content = attachment.content.encode("utf-8")
                         else:
                             xml_content = attachment.content
 
@@ -151,17 +151,17 @@ def fetch_new_filing(
                             tree = etree.fromstring(xml_content)
                             nsmap = tree.nsmap
                             ns = {
-                                'ns': (
+                                "ns": (
                                     nsmap[None]
                                     if None in nsmap
                                     else (
-                                        nsmap['ns1']
+                                        nsmap["ns1"]
                                         if "ns1" in nsmap
                                         else nsmap[find_namespaces(tree)[0]]
                                     )
                                 )
                             }
-                            info_tables = tree.xpath('//ns:infoTable', namespaces=ns)
+                            info_tables = tree.xpath("//ns:infoTable", namespaces=ns)
                             raw_holdings = gather_holdings_using_lxml(
                                 info_tables,
                                 ns,
@@ -213,27 +213,21 @@ def main(conn, cik_queue):
 
         cik = cik_queue.popleft()
 
-        try:
-            logger.info(f"Processing CIK: {cik}")
-            latest_filing_date_in_db: dt.date = get_latest_filing_using_cik_number(
-                conn, cik
+        logger.info(f"Processing CIK: {cik}")
+        latest_filing_date_in_db: dt.date = get_latest_filing_using_cik_number(
+            conn, cik
+        )
+
+        if latest_filing_date_in_db:
+            logger.info(
+                f"Most recent filing date for {cik}: {latest_filing_date_in_db}"
             )
+            fetch_new_filing(conn, cik, latest_filing_date_in_db)
+        else:
+            logger.info(f"No filings found for {cik}. Fetching all available.")
+            fetch_new_filing(conn, cik, dt.date(1970, 1, 1))
 
-            if latest_filing_date_in_db:
-                logger.info(
-                    f"Most recent filing date for {cik}: {latest_filing_date_in_db}"
-                )
-                fetch_new_filing(conn, cik, latest_filing_date_in_db)
-            else:
-                logger.info(f"No filings found for {cik}. Fetching all available.")
-                fetch_new_filing(conn, cik, dt.date(1970, 1, 1))
-
-            cik_queue.append(cik)
-
-        except Exception as e:
-            logger.error(f"Failed to process CIK {cik}: {str(e)}")
-            # If a CIK fails, add it back to the queue to retry later
-            cik_queue.append(cik)
+        cik_queue.append(cik)
 
 
 if __name__ == "__main__":
@@ -247,7 +241,7 @@ if __name__ == "__main__":
     # Parse command line arguments
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        '--cik', default=os.getenv('CIK_FILE', "ciks.txt"), help="Path to CIK file"
+        "--cik", default=os.getenv("CIK_FILE", "ciks.txt"), help="Path to CIK file"
     )
     args = parser.parse_args()
 
