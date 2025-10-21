@@ -3,11 +3,29 @@ from typing import List
 from edgar import Filing as EdgarFiling
 import datetime as dt
 from bs4 import BeautifulSoup
-from psycopg2 import sql
+from psycopg2 import extras
+import pandas as pd
+from io import StringIO
 
 from get_logger import get_logger
 
 logger = get_logger(__name__)
+
+HOLDINGS_COLUMNS = [
+    "cik",
+    "accession_number",
+    "shares_amount",
+    "value",
+    "title_of_class",
+    "share_type",
+    "investment_discretion",
+    "put_call",
+    "sole",
+    "shared",
+    "none",
+    "name_of_issuer",
+    "cusip",
+]
 
 
 def get_latest_filing_using_cik_number(conn, cik: str) -> dt.date:
@@ -29,37 +47,37 @@ def get_latest_filing_using_cik_number(conn, cik: str) -> dt.date:
 
 
 def gather_data_with_bs4(data, cik, accession_number) -> list[list]:
-    soup = BeautifulSoup(data, 'xml')
+    soup = BeautifulSoup(data, "xml")
 
     result = []
-    for row in soup.find_all('infoTable'):
-        name_of_issuer = row.find('nameOfIssuer').text.strip()  # type: ignore
-        issuer_cusip = row.find('cusip').text.strip()  # type: ignore
+    for row in soup.find_all("infoTable"):
+        name_of_issuer = row.find("nameOfIssuer").text.strip()  # type: ignore
+        issuer_cusip = row.find("cusip").text.strip()  # type: ignore
 
-        share_amount = int(float(row.find('sshPrnamt').text.strip()))  # type: ignore
+        share_amount = int(float(row.find("sshPrnamt").text.strip()))  # type: ignore
 
-        share_type = row.find('sshPrnamtType').text.strip().upper()  # type: ignore
-        if share_type not in ['SH', 'PRN']:
+        share_type = row.find("sshPrnamtType").text.strip().upper()  # type: ignore
+        if share_type not in ["SH", "PRN"]:
             raise ValueError(f"Invalid share type: {share_type}")  # type: ignore
 
-        value = int(float(row.find('value').text.strip()))  # type: ignore
+        value = int(float(row.find("value").text.strip()))  # type: ignore
 
-        investment_discretion = row.find('investmentDiscretion').text.strip().upper()  # type: ignore
-        if investment_discretion not in ['SOLE', 'DFND', 'OTR']:
+        investment_discretion = row.find("investmentDiscretion").text.strip().upper()  # type: ignore
+        if investment_discretion not in ["SOLE", "DFND", "OTR"]:
             raise ValueError(f"Invalid investment discretion: {investment_discretion}")
 
-        put_call: str = row.find('putCall').text.strip() if row.find('putCall') else "NONE"  # type: ignore
-        if put_call.strip().upper() not in ['NONE', 'PUT', 'CALL']:
+        put_call: str = row.find("putCall").text.strip() if row.find("putCall") else "NONE"  # type: ignore
+        if put_call.strip().upper() not in ["NONE", "PUT", "CALL"]:
             raise ValueError(f"Invalid put/call type: {put_call}")
 
-        title_of_class = row.find('titleOfClass').text.strip()  # type: ignore
+        title_of_class = row.find("titleOfClass").text.strip()  # type: ignore
 
-        voting_authority = row.find('votingAuthority')  # type: ignore
-        voting_authority_sole = int(float(voting_authority.find('Sole').text.strip()))  # type: ignore
+        voting_authority = row.find("votingAuthority")  # type: ignore
+        voting_authority_sole = int(float(voting_authority.find("Sole").text.strip()))  # type: ignore
         voting_authority_shared = int(
-            float(voting_authority.find('Shared').text.strip())  # type: ignore
+            float(voting_authority.find("Shared").text.strip())  # type: ignore
         )
-        voting_authority_none = int(float(voting_authority.find('None').text.strip()))  # type: ignore
+        voting_authority_none = int(float(voting_authority.find("None").text.strip()))  # type: ignore
 
         result.append(
             [
@@ -88,45 +106,45 @@ def gather_holdings_using_lxml(tables, ns, cik, accession_number) -> List[list]:
 
     for table in tables:
         # name of issuer
-        name_of_issuer = table.xpath('string(ns:nameOfIssuer)', namespaces=ns).strip()
+        name_of_issuer = table.xpath("string(ns:nameOfIssuer)", namespaces=ns).strip()
         # CUSIP
-        cusip = table.xpath('string(ns:cusip)', namespaces=ns).strip()
+        cusip = table.xpath("string(ns:cusip)", namespaces=ns).strip()
         # common stock (COM) or etc.
-        title_of_class = table.xpath('string(ns:titleOfClass)', namespaces=ns).strip()
+        title_of_class = table.xpath("string(ns:titleOfClass)", namespaces=ns).strip()
         # stock value
-        value = int(float(table.xpath('string(ns:value)', namespaces=ns).strip()))
+        value = int(float(table.xpath("string(ns:value)", namespaces=ns).strip()))
         # stock amount
         shares_amount = int(
             float(
                 table.xpath(
-                    'string(ns:shrsOrPrnAmt/ns:sshPrnamt)', namespaces=ns
+                    "string(ns:shrsOrPrnAmt/ns:sshPrnamt)", namespaces=ns
                 ).strip()
                 or 0
             )
         )
         # share type SH / PRN
         share_type = (
-            table.xpath('string(ns:shrsOrPrnAmt/ns:sshPrnamtType)', namespaces=ns)
+            table.xpath("string(ns:shrsOrPrnAmt/ns:sshPrnamtType)", namespaces=ns)
             .strip()
             .upper()
         )
-        if share_type not in ['SH', 'PRN']:
+        if share_type not in ["SH", "PRN"]:
             raise ValueError(f"Invalid share type: {share_type}")
 
         # DFND etc.
         investment_discretion = (
-            table.xpath('string(ns:investmentDiscretion)', namespaces=ns)
+            table.xpath("string(ns:investmentDiscretion)", namespaces=ns)
             .strip()
             .upper()
         )
-        if investment_discretion not in ['SOLE', 'DFND', 'OTR']:
+        if investment_discretion not in ["SOLE", "DFND", "OTR"]:
             raise ValueError(f"Invalid investment discretion: {investment_discretion}")
 
         # often blank
         put_call = (
-            table.xpath('string(ns:putCall)', namespaces=ns).strip().upper() or "NONE"
+            table.xpath("string(ns:putCall)", namespaces=ns).strip().upper() or "NONE"
         )
-        if put_call not in ['NONE', 'PUT', 'CALL']:
+        if put_call not in ["NONE", "PUT", "CALL"]:
             raise ValueError(f"Invalid put/call type: {put_call}")
 
         # voting authority - sole
@@ -134,7 +152,7 @@ def gather_holdings_using_lxml(tables, ns, cik, accession_number) -> List[list]:
             int(
                 float(
                     table.xpath(
-                        'string(ns:votingAuthority/ns:Sole)', namespaces=ns
+                        "string(ns:votingAuthority/ns:Sole)", namespaces=ns
                     ).strip()
                 )
             )
@@ -145,7 +163,7 @@ def gather_holdings_using_lxml(tables, ns, cik, accession_number) -> List[list]:
             int(
                 float(
                     table.xpath(
-                        'string(ns:votingAuthority/ns:Shared)', namespaces=ns
+                        "string(ns:votingAuthority/ns:Shared)", namespaces=ns
                     ).strip()
                 )
             )
@@ -156,7 +174,7 @@ def gather_holdings_using_lxml(tables, ns, cik, accession_number) -> List[list]:
             int(
                 float(
                     table.xpath(
-                        'string(ns:votingAuthority/ns:None)', namespaces=ns
+                        "string(ns:votingAuthority/ns:None)", namespaces=ns
                     ).strip()
                 )
             )
@@ -270,130 +288,182 @@ def insert_filing(
         raise Exception(f"Error inserting filing {accession_number}: {str(e)}")
 
 
-def get_or_create_id(
-    cur,
-    table_name: str,
-    value: str,
-    column_name: str = 'name',
-    pk_column_name: str = 'id',
-) -> int:
+def insert_lookups(conn, df):
     """
-    Retrieves the ID for a given value from a lookup table.
-    If the value does not exist, it inserts it and returns the new ID.
-
-    Args:
-        cur: The psycopg2 cursor object.
-        table_name (str): The name of the lookup table.
-        value (str): The value to look up or insert.
-        column_name (str): The name of the column to query. Defaults to 'name'.
-
-    Returns:
-        int: The ID of the existing or newly created record.
+    Inserts unique values from holdings data into lookup tables.
+    Returns a dictionary of mappings for each lookup table.
     """
-    # Check for the existing value
-    check_query = sql.SQL("SELECT {pk_column} FROM {table} WHERE {column} = %s").format(
-        pk_column=sql.Identifier(pk_column_name),
-        table=sql.Identifier(table_name),
-        column=sql.Identifier(column_name),
-    )
-    cur.execute(check_query, (value,))
-    result = cur.fetchone()
+    lookup_tables = {
+        "title_of_class_table": "title_of_class",
+        "share_type_table": "share_type",
+        "put_or_call_table": "put_call",
+        "investment_discretion_table": "investment_discretion",
+    }
 
-    if result:
-        return result[0]
+    mappings = {}
+    with conn.cursor() as cur:
+        for table, col in lookup_tables.items():
+            logger.info(f"Processing unique values for {table} from column '{col}'...")
 
-    # If not found, insert the new value and return its ID
-    insert_query = sql.SQL(
-        "INSERT INTO {table} ({column}) VALUES (%s) RETURNING {pk_column}"
-    ).format(
-        table=sql.Identifier(table_name),
-        column=sql.Identifier(column_name),
-        pk_column=sql.Identifier(pk_column_name),
-    )
-    cur.execute(insert_query, (value,))
-    return cur.fetchone()[0]
+            # Get unique values from the DataFrame column, drop NaNs, and prepare for insertion
+            unique_values = df[col].dropna().unique().tolist()
+            data_to_insert = [(val,) for val in unique_values]
+
+            insert_query = f"INSERT INTO {table} (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id;"
+
+            # Execute batch insert for each lookup table
+            cur.execute("BEGIN;")
+            extras.execute_batch(cur, insert_query, data_to_insert)
+            conn.commit()
+
+            # Get the mapping from the database
+            cur.execute(f"SELECT name, id FROM {table}")
+            mappings[col] = {row[0]: row[1] for row in cur.fetchall()}
+
+    return mappings
+
+
+def insert_issuers(conn, df):
+    """
+    Inserts unique issuers (name_of_issuer and cusip) into the issuers table.
+    Returns a dictionary mapping cusip to issuer_id.
+    """
+    logger.info("Processing unique issuers...")
+    unique_issuers_df = df[["name_of_issuer", "cusip"]].dropna().drop_duplicates()
+
+    data_to_insert = unique_issuers_df[["cusip", "name_of_issuer"]].values.tolist()
+
+    insert_query = "INSERT INTO issuers (cusip, issuer_name) VALUES (%s, %s) ON CONFLICT (cusip) DO UPDATE SET issuer_name = EXCLUDED.issuer_name;"
+
+    with conn.cursor() as cur:
+        cur.execute("BEGIN;")
+        extras.execute_batch(cur, insert_query, data_to_insert)
+        conn.commit()
+
+        # Get the mapping from the database
+        cur.execute("SELECT cusip, issuer_id FROM issuers")
+        return {row[0]: row[1] for row in cur.fetchall()}
 
 
 def insert_holdings_batch(
     conn: psycopg2.extensions.connection,
     holdings: list[list],
-    filing_id: int,
-    chunk_size: int = 50000,
 ) -> None:
-    """
-    Insert multiple holdings in a single batch operation.
-    """
-    total_inserted = 0
+    logger.info(f"Preparing to insert {len(holdings)} new holding records...")
+
+    holdings = pd.DataFrame(holdings, columns=HOLDINGS_COLUMNS)
 
     with conn.cursor() as cur:
-        # Loop through chunks of holdings
-        for i in range(0, len(holdings), chunk_size):
-            chunk = holdings[i : i + chunk_size]
+        cur.execute("SELECT accession_number, filing_id FROM filings")
+        filing_map = {row[0]: row[1] for row in cur.fetchall()}
 
-            # Prepare a list to hold the tuples for insertion
-            insert_tuples = []
+    lookup_mappings = insert_lookups(conn, holdings)
+    issuer_mapping = insert_issuers(conn, holdings)
 
-            try:
-                # Process each holding in the chunk
-                for holding in chunk:
-                    # Get or create IDs for foreign key relationships
-                    issuer_id = get_or_create_id(
-                        cur,
-                        'issuers',
-                        holding[11],
-                        'issuer_name',
-                        "issuer_id",
-                    )
-                    title_of_class_id = get_or_create_id(
-                        cur, 'title_of_class_table', holding[4]
-                    )
-                    shares_or_principal_type_id = get_or_create_id(
-                        cur, 'share_type_table', holding[5]
-                    )
-                    put_or_call_id = get_or_create_id(
-                        cur, 'put_or_call_table', holding[7]
-                    )
-                    investment_discretion_id = get_or_create_id(
-                        cur,
-                        'investment_discretion_table',
-                        holding[6],
-                    )
+    # Step 3: Map the string columns to their corresponding integer IDs
+    logger.info("Mapping holdings data to IDs...")
+    holdings["filing_id"] = holdings["accession_number"].map(filing_map)
+    holdings["issuer_id"] = holdings["cusip"].map(issuer_mapping)
+    holdings["title_of_class_id"] = holdings["title_of_class"].map(
+        lookup_mappings["title_of_class"]
+    )
+    holdings["share_type_id"] = holdings["share_type"].map(
+        lookup_mappings["share_type"]
+    )
+    holdings["put_call_id"] = holdings["put_call"].map(lookup_mappings["put_call"])
+    holdings["investment_discretion_id"] = holdings["investment_discretion"].map(
+        lookup_mappings["investment_discretion"]
+    )
 
-                    # Create the tuple for this holding
-                    holding_tuple = (
-                        filing_id,
-                        issuer_id,
-                        title_of_class_id,
-                        holding[2],
-                        shares_or_principal_type_id,
-                        holding[3],
-                        put_or_call_id,
-                        investment_discretion_id,
-                        holding[8],
-                        holding[9],
-                        holding[10],
-                    )
-                    insert_tuples.append(holding_tuple)
+    # # Step 4: Drop any rows that failed to map
+    holdings.dropna(
+        subset=[
+            "filing_id",
+            "issuer_id",
+            "title_of_class_id",
+            "share_type_id",
+            "put_call_id",
+            "investment_discretion_id",
+        ],
+        inplace=True,
+    )
 
-                # Use executemany for efficient batch insertion
-                query = """
-                    INSERT INTO holdings (
-                        filing_id, issuer_id, title_of_class, shares_or_principal_amount,
-                        shares_or_principal_type, value, put_or_call, investment_discretion,
-                        voting_authority_sole, voting_authority_shared, voting_authority_none
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """
-                cur.executemany(query, insert_tuples)
-                conn.commit()
-                total_inserted += len(chunk)
-                logger.info(
-                    f"✅ Inserted chunk of {len(chunk)} holdings (total: {total_inserted})"
-                )
+    int64_columns = [
+        "filing_id",
+        "issuer_id",
+        "title_of_class_id",
+        "share_type_id",
+        "put_call_id",
+        "investment_discretion_id",
+        "shares_amount",
+        "value",
+        "sole",
+        "shared",
+        "none",
+    ]
 
-            except psycopg2.Error as e:
-                logger.error(f"❌ Failed to insert chunk starting at index {i}: {e}")
-                conn.rollback()
-                break  # Stop processing if an error occurs
+    holdings[int64_columns] = holdings[int64_columns].astype("Int64")
+
+    final_df = holdings[
+        [
+            "filing_id",
+            "issuer_id",
+            "title_of_class_id",
+            "shares_amount",
+            "share_type_id",
+            "value",
+            "put_call_id",
+            "investment_discretion_id",
+            "sole",
+            "shared",
+            "none",
+        ]
+    ].copy()
+
+    final_df.rename(
+        columns={
+            "title_of_class_id": "title_of_class",
+            "shares_amount": "shares_or_principal_amount",
+            "share_type_id": "shares_or_principal_type",
+            "put_call_id": "put_or_call",
+            "investment_discretion_id": "investment_discretion",
+            "sole": "voting_authority_sole",
+            "shared": "voting_authority_shared",
+            "none": "voting_authority_none",
+        },
+        inplace=True,
+    )
+
+    logger.info("Reading holdings data into memory buffer for COPY command...")
+    csv_buffer = StringIO()
+    final_df.to_csv(csv_buffer, index=False, header=False, sep="\t")
+    csv_buffer.seek(0)
+
+    logger.info("Starting bulk insert of holdings data using COPY command...")
+    with conn.cursor() as cur:
+        logger.info(
+            f"Starting bulk insert of {len(final_df)} holdings records using COPY command..."
+        )
+        cur.copy_from(
+            csv_buffer,
+            "holdings",
+            sep="\t",
+            columns=(
+                "filing_id",
+                "issuer_id",
+                "title_of_class",
+                "shares_or_principal_amount",
+                "shares_or_principal_type",
+                "value",
+                "put_or_call",
+                "investment_discretion",
+                "voting_authority_sole",
+                "voting_authority_shared",
+                "voting_authority_none",
+            ),
+        )
+        conn.commit()
+    logger.info("Holdings data inserted successfully")
 
 
 def filing_exists(conn, accession_number) -> bool:

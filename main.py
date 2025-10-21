@@ -177,7 +177,7 @@ def fetch_new_filing(
                             )
 
                         if raw_holdings:
-                            insert_holdings_batch(conn, raw_holdings, new_filing_id)
+                            insert_holdings_batch(conn, raw_holdings)
             else:
                 logger.info(
                     f"Filing date {filing_date} is not newer than most recent date {most_recent_date} for CIK {cik_number}"
