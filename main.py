@@ -58,16 +58,6 @@ def connect_db() -> psycopg2.extensions.connection:
         sys.exit(1)  # Exit with an error code
 
 
-def ping_healthchecks() -> None:
-    """Ping the healthcheck URL every minute."""
-    while True:
-        try:
-            requests.get(HEALTHCHECK_URL, timeout=10)
-        except Exception as e:
-            logger.error(f"Healthcheck ping failed: {str(e)}")
-        time.sleep(60)  # Ping every minute
-
-
 def find_namespaces(tree):
     """Find all unique namespaces in the XML tree."""
     all_elements = tree.xpath("//*")
@@ -201,7 +191,7 @@ def fetch_new_filing(
             raise Exception(f"Error fetching filings for CIK {cik_number}: {str(e)}")
 
 
-def main(conn, cik_queue):
+def main(conn, cik_queue: deque):
     """Main processing loop for a list of CIKs."""
     logger.info(f"Processing {len(cik_queue)} CIKs")
 
@@ -211,32 +201,51 @@ def main(conn, cik_queue):
             time.sleep(3)
             continue
 
+        if conn.closed != 0:
+            logger.warning("Database connection lost. Reconnecting...")
+            try:
+                conn = connect_db()
+            except Exception as e:
+                logger.error(
+                    f"Failed to reconnect to database: {e}. Retrying in 10s..."
+                )
+                time.sleep(10)
+                continue
+
         cik = cik_queue.popleft()
-
         logger.info(f"Processing CIK: {cik}")
-        latest_filing_date_in_db: dt.date = get_latest_filing_using_cik_number(
-            conn, cik
-        )
 
-        if latest_filing_date_in_db:
-            logger.info(
-                f"Most recent filing date for {cik}: {latest_filing_date_in_db}"
+        try:
+            latest_filing_date_in_db: dt.date = get_latest_filing_using_cik_number(
+                conn, cik
             )
-            fetch_new_filing(conn, cik, latest_filing_date_in_db)
-        else:
-            logger.info(f"No filings found for {cik}. Fetching all available.")
-            fetch_new_filing(conn, cik, dt.date(1970, 1, 1))
+
+            if latest_filing_date_in_db:
+                logger.info(
+                    f"Most recent filing date for {cik}: {latest_filing_date_in_db}"
+                )
+                fetch_new_filing(conn, cik, latest_filing_date_in_db)
+            else:
+                logger.info(f"No filings found for {cik}. Fetching all available.")
+                start_date = dt.date.today() - dt.timedelta(days=730)
+                fetch_new_filing(conn, cik, start_date)
+
+            try:
+                requests.get(HEALTHCHECK_URL, timeout=10)
+            except Exception as e:
+                logger.error(f"Healthcheck ping failed: {str(e)}")
+
+        except Exception as e:
+            # If a specific CIK fails, log it, but KEEP RUNNING!
+            logger.error(f"Failed processing CIK {cik}: {e}")
 
         cik_queue.append(cik)
+        time.sleep(1)
 
 
 if __name__ == "__main__":
     # connect to database
     conn = connect_db()
-
-    # Start healthcheck thread
-    health_thread = Thread(target=ping_healthchecks, daemon=True)
-    health_thread.start()
 
     # Parse command line arguments
     parser = argparse.ArgumentParser()
