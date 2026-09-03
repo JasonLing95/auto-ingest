@@ -89,8 +89,8 @@ jobs:
               -e DB_PASSWORD=$DB_PASSWORD \
               -e DB_PORT=5432 \
               -e DB_NAME=sec \
-              -e HEALTHCHECK_URL=https://hc-ping.com/b4bd8cc7-3966-45ec-a163-74a07c66f95a \
-              -e SEC_IDENTITY=example121.company@access.com \
+              -e HEALTHCHECK_URL=https://hc-ping.com/e482672a-e62b-41f9-bd45-a47a154fda5d \
+              -e SEC_IDENTITY=740b8030e0ab.company@access.com \
               $IMAGE_NAME \
               --cik /app/cik/ciks.txt
 
