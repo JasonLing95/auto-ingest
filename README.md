@@ -45,6 +45,6 @@ python main.py --cik path/to/ciks.txt
 
 Run it in Docker
 ```
-docker run -d --network=common-net -v /app/logs:/app/logs -v /app/cik:/app/cik -e DB_HOST=sec-database -e DB_PASSWORD=password -e DB_PORT=5432 -e DB_NAME=sec autoingest:1.0 --cik /app/cik/ciks.txt
+docker run -d --memory="350m" --cpus="0.4" --network=common-net -v /app/logs:/app/logs -v /app/cik:/app/cik -e DB_HOST=sec-database -e DB_PASSWORD=password -e DB_PORT=5432 -e DB_NAME=sec autoingest:1.0 --cik /app/cik/ciks.txt
 ```
 

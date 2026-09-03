@@ -1,4 +1,5 @@
 from edgar import set_identity, Company
+import random
 import datetime as dt
 from ratelimit import limits, RateLimitException
 from backoff import on_exception, expo
@@ -14,6 +15,7 @@ import psycopg2
 import sys
 
 from utils import (
+    connect_db,
     get_latest_filing_using_cik_number,
     insert_filing,
     insert_holdings_batch,
@@ -33,29 +35,6 @@ HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "https://example.com/healthcheck"
 MAX_RETRIES = 3
 VALID_FORMS = ["13F-HR", "13F-HR/A", "13F-HR/A/A"]  # Valid forms to fetch filings for
 DUCKDB_PATH = os.getenv("DUCKDB_PATH", "edgar_db.db")
-
-
-def connect_db() -> psycopg2.extensions.connection:
-    """Connect to PostgreSQL database using environment variables."""
-    try:
-        conn = psycopg2.connect(
-            host=os.getenv("DB_HOST", "localhost"),
-            database=os.getenv("DB_NAME", "sec"),
-            user=os.getenv("DB_USER", "postgres"),
-            password=os.getenv("DB_PASSWORD"),
-            port=os.getenv("DB_PORT", 5432),
-        )
-        print("Connected to PostgreSQL database successfully.")
-        return conn
-    # Catch the critical database connection error
-    except psycopg2.OperationalError as e:
-        logger.critical(f"Database connection error: {e}. Shutting down.")
-        sys.exit(1)  # Exit with an error code
-
-    # Catch any other unexpected, fatal errors
-    except Exception as e:
-        logger.critical(f"An unrecoverable error occurred: {e}. Shutting down.")
-        sys.exit(1)  # Exit with an error code
 
 
 def find_namespaces(tree):
@@ -120,6 +99,11 @@ def fetch_new_filing(
                     continue
 
                 new_filing_id = insert_filing(conn, cik_number, filing)
+                if not new_filing_id:
+                    logger.info(
+                        f"Filing {accession_number} already handled concurrently; skipping holdings."
+                    )
+                    continue
 
                 # insert holdings
                 # Looping through attachments to find XML files
@@ -240,7 +224,9 @@ def main(conn, cik_queue: deque):
             logger.error(f"Failed processing CIK {cik}: {e}")
 
         cik_queue.append(cik)
-        time.sleep(1)
+        sleep_time = 15 + random.uniform(1.0, 5.0)
+        logger.info(f"Sleeping for {sleep_time:.1f} seconds...")
+        time.sleep(sleep_time)
 
 
 if __name__ == "__main__":

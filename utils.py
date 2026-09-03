@@ -1,5 +1,7 @@
+import os
+import sys
 import psycopg2
-from typing import List
+from typing import List, Optional
 from edgar import Filing as EdgarFiling
 import datetime as dt
 from bs4 import BeautifulSoup
@@ -10,6 +12,29 @@ from io import StringIO
 from get_logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def connect_db() -> psycopg2.extensions.connection:
+    """Connect to PostgreSQL database using environment variables."""
+    try:
+        conn = psycopg2.connect(
+            dbname=os.getenv("DB_NAME", "sec"),
+            user=os.getenv("DB_USER", "postgres"),
+            password=os.getenv("DB_PASSWORD"),
+            host=os.getenv("DB_HOST", "localhost"),
+            port=os.getenv("DB_PORT", "5432"),
+        )
+        # CRITICAL: Prevents 'idle in transaction' leaks on read queries
+        conn.autocommit = True
+        logger.info("Connected to PostgreSQL database successfully.")
+        return conn
+    except psycopg2.OperationalError as e:
+        logger.critical(f"Database connection error: {e}. Shutting down.")
+        sys.exit(1)
+    except Exception as e:
+        logger.critical(f"An unrecoverable error occurred: {e}. Shutting down.")
+        sys.exit(1)
+
 
 HOLDINGS_COLUMNS = [
     "cik",
@@ -204,7 +229,7 @@ def gather_holdings_using_lxml(tables, ns, cik, accession_number) -> List[list]:
 
 def insert_filing(
     conn: psycopg2.extensions.connection, cik: str, filing: EdgarFiling
-) -> int:
+) -> Optional[int]:
     accession_number = filing.accession_number
 
     try:
@@ -245,14 +270,15 @@ def insert_filing(
 
             company_id = company_id_result[0]
 
-            # Step 2: Prepare the INSERT query with psycopg2-style placeholders.
+            # Step 2: Prepare the INSERT query with ON CONFLICT DO NOTHING
             query = """
                 INSERT INTO filings (
                     company_id, form_type, accession_number,
                     filing_date, file_number, filing_directory,
                     period_of_report, created_at, updated_at
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING filing_id
+                ON CONFLICT (accession_number) DO NOTHING
+                RETURNING filing_id;
             """
 
             # Step 3: Prepare the parameters as a tuple.
@@ -270,14 +296,20 @@ def insert_filing(
 
             # Step 4: Execute the query within a cursor block.
             cur.execute(query, params)
-            new_filing_id = cur.fetchone()[0]  # type: ignore
+            res = cur.fetchone()
+            new_filing_id = res[0] if res else None
 
-            # Step 5: Commit the transaction.
+            # Step 5: Commit immediately to release all locks
             conn.commit()
 
-            logger.info(
-                f"✅ Successfully inserted filing {accession_number} with ID {new_filing_id}"
-            )
+            if new_filing_id:
+                logger.info(
+                    f"✅ Successfully inserted filing {accession_number} with ID {new_filing_id}"
+                )
+            else:
+                logger.info(
+                    f"⚠️ Filing {accession_number} already exists in database (conflict avoided). Skipping insertion."
+                )
 
             return new_filing_id
 

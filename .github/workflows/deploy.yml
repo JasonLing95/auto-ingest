@@ -1,0 +1,98 @@
+name: Deploy AutoIngest
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    # Explicitly grant the automatic token permission to interact with GHCR
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Convert GitHub username to lowercase for strict Docker naming rules
+      - name: Set lower case owner name
+        run: |
+          echo "OWNER_LC=${OWNER,,}" >>${GITHUB_ENV}
+        env:
+          OWNER: '${{ github.repository_owner }}'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ env.OWNER_LC }}/autoingest:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: SSH into Server, Pull, and Restart Container
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_USER: ${{ github.actor }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          envs: GH_TOKEN,GH_USER,REPO_OWNER,DB_PASSWORD
+          script: |
+            # Convert the repository owner to lowercase directly on the server
+            LOWERCASE_OWNER=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
+            IMAGE_NAME="ghcr.io/$LOWERCASE_OWNER/autoingest:latest"
+
+            echo "Attempting to pull and run image: $IMAGE_NAME"
+
+            # 1. Log in to GHCR using the ephemeral GitHub token
+            echo $GH_TOKEN | docker login ghcr.io -u $GH_USER --password-stdin
+
+            # 2. Pull the latest image
+            docker pull $IMAGE_NAME
+
+            # 3. Stop and remove existing container(s)
+            docker stop autoingest 2>/dev/null || true
+            docker rm autoingest 2>/dev/null || true
+            docker stop compassionate_nightingale 2>/dev/null || true
+            docker rm compassionate_nightingale 2>/dev/null || true
+
+            # 4. Run the new container with resource limits and parameters
+            docker run -d \
+              --name autoingest \
+              --restart always \
+              --network=network-a \
+              --memory="350m" \
+              --cpus="0.4" \
+              -v /app/autoingest_logs:/app/logs \
+              -v /app/cik:/app/cik \
+              -e DB_HOST=sec-database \
+              -e DB_PASSWORD=$DB_PASSWORD \
+              -e DB_PORT=5432 \
+              -e DB_NAME=sec \
+              -e HEALTHCHECK_URL=https://hc-ping.com/b4bd8cc7-3966-45ec-a163-74a07c66f95a \
+              -e SEC_IDENTITY=example121.company@access.com \
+              $IMAGE_NAME \
+              --cik /app/cik/ciks.txt
+
+            # 5. Clean up dangling images to save disk space
+            docker image prune -f
