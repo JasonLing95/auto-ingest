@@ -84,6 +84,10 @@ class Holding:
     _issuer_name: Optional[str] = None
     _issuer_cusip: Optional[str] = None
 
+    def __post_init__(self):
+        if self._issuer_cusip:
+            self._issuer_cusip = self._issuer_cusip.strip().upper()
+
 
 @dataclass
 class Issuer:
@@ -95,8 +99,14 @@ class Issuer:
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
+    def __post_init__(self):
+        if self.cusip:
+            self.cusip = self.cusip.strip().upper()
+
     def validate(self):
         """Validate issuer data before insertion"""
+        if self.cusip:
+            self.cusip = self.cusip.strip().upper()
         if not self.cusip or len(self.cusip) > 9:
             raise ValueError("CUSIP must be 1-9 characters")
         if not self.issuer_name or len(self.issuer_name) > 255:

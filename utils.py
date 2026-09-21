@@ -53,6 +53,13 @@ HOLDINGS_COLUMNS = [
 ]
 
 
+def normalize_cusip(cusip: Optional[str]) -> str:
+    """Normalize CUSIP to uppercase and stripped of whitespace."""
+    if not cusip:
+        return ""
+    return str(cusip).strip().upper()
+
+
 def get_latest_filing_using_cik_number(conn, cik: str) -> dt.date:
     """Fetch the most recent filing for a given CIK"""
     with conn.cursor() as cur:
@@ -76,8 +83,9 @@ def gather_data_with_bs4(data, cik, accession_number) -> list[list]:
 
     result = []
     for row in soup.find_all("infoTable"):
-        name_of_issuer = row.find("nameOfIssuer").text.strip()  # type: ignore
-        issuer_cusip = row.find("cusip").text.strip()  # type: ignore
+        name_of_issuer = row.find("nameOfIssuer").text.strip() if row.find("nameOfIssuer") else ""
+        raw_cusip = row.find("cusip")
+        issuer_cusip = normalize_cusip(raw_cusip.text if raw_cusip else None)
 
         share_amount = int(float(row.find("sshPrnamt").text.strip()))  # type: ignore
 
@@ -132,8 +140,8 @@ def gather_holdings_using_lxml(tables, ns, cik, accession_number) -> List[list]:
     for table in tables:
         # name of issuer
         name_of_issuer = table.xpath("string(ns:nameOfIssuer)", namespaces=ns).strip()
-        # CUSIP
-        cusip = table.xpath("string(ns:cusip)", namespaces=ns).strip()
+        # CUSIP (normalized to uppercase)
+        cusip = normalize_cusip(table.xpath("string(ns:cusip)", namespaces=ns))
         # common stock (COM) or etc.
         title_of_class = table.xpath("string(ns:titleOfClass)", namespaces=ns).strip()
         # stock value
@@ -358,10 +366,17 @@ def insert_lookups(conn, df):
 def insert_issuers(conn, df):
     """
     Inserts unique issuers (name_of_issuer and cusip) into the issuers table.
-    Returns a dictionary mapping cusip to issuer_id.
+    Returns a dictionary mapping normalized uppercase cusip to issuer_id.
     """
     logger.info("Processing unique issuers...")
-    unique_issuers_df = df[["name_of_issuer", "cusip"]].dropna().drop_duplicates()
+    unique_issuers_df = df[["name_of_issuer", "cusip"]].dropna().copy()
+    unique_issuers_df["cusip"] = unique_issuers_df["cusip"].apply(normalize_cusip)
+    unique_issuers_df["name_of_issuer"] = (
+        unique_issuers_df["name_of_issuer"].astype(str).str.strip()
+    )
+    unique_issuers_df = unique_issuers_df[
+        unique_issuers_df["cusip"] != ""
+    ].drop_duplicates(subset=["cusip"])
 
     data_to_insert = unique_issuers_df[["cusip", "name_of_issuer"]].values.tolist()
 
@@ -372,9 +387,17 @@ def insert_issuers(conn, df):
         extras.execute_batch(cur, insert_query, data_to_insert)
         conn.commit()
 
-        # Get the mapping from the database
-        cur.execute("SELECT cusip, issuer_id FROM issuers")
-        return {row[0]: row[1] for row in cur.fetchall()}
+        # Get the mapping from the database, prioritizing canonical uppercase records
+        cur.execute("""
+            SELECT cusip, issuer_id
+            FROM issuers
+            ORDER BY (cusip = UPPER(TRIM(cusip))) ASC, issuer_id DESC
+        """)
+        mapping = {}
+        for cusip_val, issuer_id in cur.fetchall():
+            if cusip_val:
+                mapping[normalize_cusip(cusip_val)] = issuer_id
+        return mapping
 
 
 def insert_holdings_batch(
@@ -384,6 +407,7 @@ def insert_holdings_batch(
     logger.info(f"Preparing to insert {len(holdings)} new holding records...")
 
     holdings = pd.DataFrame(holdings, columns=HOLDINGS_COLUMNS)
+    holdings["cusip"] = holdings["cusip"].apply(normalize_cusip)
 
     with conn.cursor() as cur:
         cur.execute("SELECT accession_number, filing_id FROM filings")

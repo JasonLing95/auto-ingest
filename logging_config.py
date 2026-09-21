@@ -5,8 +5,10 @@ import os
 
 
 def configure_logging(
-    log_directory: str = '/app/logs',
-    log_file: str = 'sec_filings.log',
+    log_directory: str = os.getenv(
+        "LOG_DIR", "/app/logs" if os.path.exists("/app") else "./logs"
+    ),
+    log_file: str = "sec_filings.log",
     max_bytes: int = 10 * 1024 * 1024,  # 10 MB
     backup_count: int = 5,
     level: int = logging.INFO,
@@ -21,7 +23,11 @@ def configure_logging(
         level: Logging level
         console_output: Whether to output to console
     """
-    os.makedirs(log_directory, exist_ok=True)
+    try:
+        os.makedirs(log_directory, exist_ok=True)
+    except OSError:
+        log_directory = "./logs"
+        os.makedirs(log_directory, exist_ok=True)
     log_path = os.path.join(log_directory, log_file)
 
     # Create a custom formatter
