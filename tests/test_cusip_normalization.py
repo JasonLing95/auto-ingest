@@ -151,6 +151,35 @@ class TestCusipNormalization(unittest.TestCase):
         )
         self.assertEqual(holding._issuer_cusip, "02079K305")
 
+    def test_insert_issuers_lock_free_skips_existing_rows(self):
+        """Test that insert_issuers executes 0 insert operations when all CUSIPs already exist."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+        # All CUSIPs in the dataframe already exist in the database
+        mock_cursor.fetchall.return_value = [
+            ("AAPL12345", 101),
+            ("MSFT67890", 102),
+        ]
+
+        df = pd.DataFrame([
+            ["0000000001", "acc1", 100, 1000, "COM", "SH", "SOLE", "NONE", 100, 0, 0, "APPLE INC", "AAPL12345"],
+            ["0000000001", "acc1", 200, 2000, "COM", "SH", "SOLE", "NONE", 200, 0, 0, "MICROSOFT CORP", "MSFT67890"],
+        ], columns=HOLDINGS_COLUMNS)
+
+        mapping = insert_issuers(mock_conn, df)
+
+        self.assertEqual(mapping["AAPL12345"], 101)
+        self.assertEqual(mapping["MSFT67890"], 102)
+
+        # Confirm cur.execute was only called for SELECT queries, never INSERT or BEGIN
+        executed_sqls = [call[0][0] for call in mock_cursor.execute.call_args_list]
+        for sql in executed_sqls:
+            self.assertIn("SELECT", sql)
+            self.assertNotIn("INSERT", sql)
+            self.assertNotIn("BEGIN", sql)
+
 
 if __name__ == "__main__":
     unittest.main()

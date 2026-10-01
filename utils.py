@@ -26,6 +26,9 @@ def connect_db() -> psycopg2.extensions.connection:
         )
         # CRITICAL: Prevents 'idle in transaction' leaks on read queries
         conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SET lock_timeout = '10s';")
+            cur.execute("SET statement_timeout = '120s';")
         logger.info("Connected to PostgreSQL database successfully.")
         return conn
     except psycopg2.OperationalError as e:
@@ -351,10 +354,8 @@ def insert_lookups(conn, df):
 
             insert_query = f"INSERT INTO {table} (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id;"
 
-            # Execute batch insert for each lookup table
-            cur.execute("BEGIN;")
+            # Execute batch insert in autocommit mode without transaction leaks
             extras.execute_batch(cur, insert_query, data_to_insert)
-            conn.commit()
 
             # Get the mapping from the database
             cur.execute(f"SELECT name, id FROM {table}")
@@ -367,6 +368,7 @@ def insert_issuers(conn, df):
     """
     Inserts unique issuers (name_of_issuer and cusip) into the issuers table.
     Returns a dictionary mapping normalized uppercase cusip to issuer_id.
+    Uses a lock-free check-before-insert pattern with ON CONFLICT DO NOTHING.
     """
     logger.info("Processing unique issuers...")
     unique_issuers_df = df[["name_of_issuer", "cusip"]].dropna().copy()
@@ -378,25 +380,56 @@ def insert_issuers(conn, df):
         unique_issuers_df["cusip"] != ""
     ].drop_duplicates(subset=["cusip"])
 
-    data_to_insert = unique_issuers_df[["cusip", "name_of_issuer"]].values.tolist()
+    if unique_issuers_df.empty:
+        return {}
 
-    insert_query = "INSERT INTO issuers (cusip, issuer_name) VALUES (%s, %s) ON CONFLICT (cusip) DO UPDATE SET issuer_name = EXCLUDED.issuer_name;"
+    cusip_list = unique_issuers_df["cusip"].tolist()
 
     with conn.cursor() as cur:
-        cur.execute("BEGIN;")
-        extras.execute_batch(cur, insert_query, data_to_insert)
-        conn.commit()
-
-        # Get the mapping from the database, prioritizing canonical uppercase records
-        cur.execute("""
+        # Step 1: Lock-free read to find which CUSIPs already exist
+        cur.execute(
+            """
             SELECT cusip, issuer_id
             FROM issuers
-            ORDER BY (cusip = UPPER(TRIM(cusip))) ASC, issuer_id DESC
-        """)
+            WHERE cusip = ANY(%s)
+            ORDER BY (cusip = UPPER(TRIM(cusip))) ASC, issuer_id DESC;
+            """,
+            (cusip_list,),
+        )
         mapping = {}
         for cusip_val, issuer_id in cur.fetchall():
             if cusip_val:
                 mapping[normalize_cusip(cusip_val)] = issuer_id
+
+        # Step 2: Filter to only brand-new CUSIPs that do not exist yet
+        new_issuers_df = unique_issuers_df[~unique_issuers_df["cusip"].isin(mapping)]
+
+        # Step 3: Insert only brand-new CUSIPs with ON CONFLICT DO NOTHING (lock-free for existing rows)
+        if not new_issuers_df.empty:
+            data_to_insert = new_issuers_df[["cusip", "name_of_issuer"]].values.tolist()
+            insert_query = """
+                INSERT INTO issuers (cusip, issuer_name)
+                VALUES (%s, %s)
+                ON CONFLICT (cusip) DO NOTHING;
+            """
+            extras.execute_batch(cur, insert_query, data_to_insert)
+
+            # Re-fetch mapping for newly inserted CUSIPs
+            missing_cusips = [c for c in cusip_list if c not in mapping]
+            if missing_cusips:
+                cur.execute(
+                    """
+                    SELECT cusip, issuer_id
+                    FROM issuers
+                    WHERE cusip = ANY(%s)
+                    ORDER BY (cusip = UPPER(TRIM(cusip))) ASC, issuer_id DESC;
+                    """,
+                    (missing_cusips,),
+                )
+                for cusip_val, issuer_id in cur.fetchall():
+                    if cusip_val:
+                        mapping[normalize_cusip(cusip_val)] = issuer_id
+
         return mapping
 
 
