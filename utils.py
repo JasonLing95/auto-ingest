@@ -63,6 +63,19 @@ def normalize_cusip(cusip: Optional[str]) -> str:
     return str(cusip).strip().upper()
 
 
+def normalize_form_type(raw_form: Optional[str]) -> str:
+    """Normalize SEC form type to fit VARCHAR(10) and match canonical forms ('13F-HR', '13F-HR/A')."""
+    if not raw_form:
+        return "13F-HR"
+    raw_form_upper = str(raw_form).strip().upper()
+    if "13F-HR/A" in raw_form_upper:
+        return "13F-HR/A"
+    elif "13F-HR" in raw_form_upper:
+        return "13F-HR"
+    else:
+        return raw_form_upper.split(" - ")[0].split()[0][:10].strip()
+
+
 def get_latest_filing_using_cik_number(conn, cik: str) -> dt.date:
     """Fetch the most recent filing for a given CIK"""
     with conn.cursor() as cur:
@@ -253,7 +266,7 @@ def insert_filing(
     except ArithmeticError:
         period_of_report = None
 
-    filing_form_type = filing.form
+    filing_form_type = normalize_form_type(getattr(filing, "form", None))
 
     try:
         file_number = filing.file_number  # type: ignore

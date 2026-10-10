@@ -5,6 +5,7 @@ from lxml import etree
 
 from utils import (
     normalize_cusip,
+    normalize_form_type,
     gather_data_with_bs4,
     gather_holdings_using_lxml,
     insert_issuers,
@@ -179,6 +180,21 @@ class TestCusipNormalization(unittest.TestCase):
             self.assertIn("SELECT", sql)
             self.assertNotIn("INSERT", sql)
             self.assertNotIn("BEGIN", sql)
+
+    def test_normalize_form_type(self):
+        """Test normalization and truncation safeguards for SEC form types."""
+        self.assertEqual(normalize_form_type("13F-HR"), "13F-HR")
+        self.assertEqual(normalize_form_type("13F-HR/A"), "13F-HR/A")
+        self.assertEqual(normalize_form_type("13F-HR - RFG"), "13F-HR")
+        self.assertEqual(normalize_form_type("13F-HR/A - RFG"), "13F-HR/A")
+        self.assertEqual(normalize_form_type("13F-HR/A/A"), "13F-HR/A")
+        self.assertEqual(normalize_form_type(" 13f-hr "), "13F-HR")
+        self.assertEqual(normalize_form_type(" 13f-hr/a "), "13F-HR/A")
+        self.assertEqual(normalize_form_type(None), "13F-HR")
+        self.assertEqual(normalize_form_type(""), "13F-HR")
+        # Ensure any arbitrary form type never exceeds VARCHAR(10)
+        long_form = normalize_form_type("CUSTOM_VERY_LONG_FORM_NAME - SUFFIX")
+        self.assertLessEqual(len(long_form), 10)
 
 
 if __name__ == "__main__":
