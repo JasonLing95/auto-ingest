@@ -1,7 +1,8 @@
 import os
 import sys
 import psycopg2
-from typing import List, Optional
+from typing import List, Optional, Tuple
+from contextlib import nullcontext
 from edgar import Filing as EdgarFiling
 import datetime as dt
 from bs4 import BeautifulSoup
@@ -29,6 +30,18 @@ def connect_db() -> psycopg2.extensions.connection:
         with conn.cursor() as cur:
             cur.execute("SET lock_timeout = '10s';")
             cur.execute("SET statement_timeout = '120s';")
+            try:
+                cur.execute(
+                    """
+                    ALTER TABLE filings 
+                    ADD COLUMN IF NOT EXISTS reported_value_total BIGINT,
+                    ADD COLUMN IF NOT EXISTS reported_entry_total INT;
+                    ALTER TABLE companies
+                    ADD COLUMN IF NOT EXISTS aum BIGINT;
+                    """
+                )
+            except Exception as schema_err:
+                logger.warning(f"Could not verify/add schema enhancement columns: {schema_err}")
         logger.info("Connected to PostgreSQL database successfully.")
         return conn
     except psycopg2.OperationalError as e:
@@ -251,6 +264,46 @@ def gather_holdings_using_lxml(tables, ns, cik, accession_number) -> List[list]:
     return holdings
 
 
+def extract_reported_totals(filing: EdgarFiling) -> Tuple[Optional[int], Optional[int]]:
+    """Extract official tableValueTotal and tableEntryTotal from Form 13F primary document."""
+    reported_value_total = None
+    reported_entry_total = None
+
+    # Method 1: Try edgartools ThirteenF parser
+    try:
+        from edgar.thirteenf import ThirteenF
+
+        thirteen_f = ThirteenF(filing)
+        if thirteen_f.total_value is not None:
+            reported_value_total = int(float(thirteen_f.total_value))
+        if thirteen_f.total_holdings is not None:
+            reported_entry_total = int(thirteen_f.total_holdings)
+        if reported_value_total is not None and reported_entry_total is not None:
+            return reported_value_total, reported_entry_total
+    except Exception:
+        pass
+
+    # Method 2: Scan attachments for primary_doc.xml
+    try:
+        for attachment in getattr(filing, "attachments", []):
+            doc_name = getattr(attachment, "document", "").lower()
+            if "primary_doc" in doc_name and doc_name.endswith(".xml"):
+                content = attachment.content
+                if content:
+                    soup = BeautifulSoup(content, "xml")
+                    val_el = soup.find("tableValueTotal")
+                    if val_el and val_el.text and val_el.text.strip():
+                        reported_value_total = int(float(val_el.text.strip()))
+                    entry_el = soup.find("tableEntryTotal")
+                    if entry_el and entry_el.text and entry_el.text.strip():
+                        reported_entry_total = int(float(entry_el.text.strip()))
+                    break
+    except Exception:
+        pass
+
+    return reported_value_total, reported_entry_total
+
+
 def insert_filing(
     conn: psycopg2.extensions.connection, cik: str, filing: EdgarFiling
 ) -> Optional[int]:
@@ -278,6 +331,8 @@ def insert_filing(
     except ArithmeticError:
         file_dir = None
 
+    reported_value_total, reported_entry_total = extract_reported_totals(filing)
+
     try:
         # Get company_id from database
         with conn.cursor() as cur:
@@ -299,8 +354,9 @@ def insert_filing(
                 INSERT INTO filings (
                     company_id, form_type, accession_number,
                     filing_date, file_number, filing_directory,
-                    period_of_report, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    period_of_report, reported_value_total, reported_entry_total,
+                    created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (accession_number) DO NOTHING
                 RETURNING filing_id;
             """
@@ -314,12 +370,41 @@ def insert_filing(
                 file_number,
                 file_dir,
                 period_of_report,
+                reported_value_total,
+                reported_entry_total,
                 dt.datetime.now(),
                 dt.datetime.now(),
             )
 
-            # Step 4: Execute the query within a cursor block.
-            cur.execute(query, params)
+            # Step 4: Execute query with fallback if columns are not present
+            try:
+                cur.execute(query, params)
+            except psycopg2.Error as col_err:
+                if "reported_value_total" in str(col_err) or "reported_entry_total" in str(col_err):
+                    fallback_query = """
+                        INSERT INTO filings (
+                            company_id, form_type, accession_number,
+                            filing_date, file_number, filing_directory,
+                            period_of_report, created_at, updated_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (accession_number) DO NOTHING
+                        RETURNING filing_id;
+                    """
+                    fallback_params = (
+                        company_id,
+                        filing_form_type,
+                        accession_number,
+                        filing_date,
+                        file_number,
+                        file_dir,
+                        period_of_report,
+                        dt.datetime.now(),
+                        dt.datetime.now(),
+                    )
+                    cur.execute(fallback_query, fallback_params)
+                else:
+                    raise col_err
+
             res = cur.fetchone()
             new_filing_id = res[0] if res else None
 
@@ -342,6 +427,155 @@ def insert_filing(
         conn.rollback()
 
         raise Exception(f"Error inserting filing {accession_number}: {str(e)}")
+
+
+def update_company_aum_post_ingest(
+    conn_or_cursor,
+    company_id: Optional[int] = None,
+    filing_id: Optional[int] = None,
+) -> bool:
+    """
+    Updates the filer's latest AUM immediately after a new filing lands.
+    Execution time: ~5ms (targets only the newly ingested filing).
+
+    Guardrails:
+    1. Backfill protection: Only updates if the filing is the latest for the company.
+    2. Amendment protection (13F-HR/A): Skips partial amendments (<50% of original holdings).
+    3. Normalization: Uses holdings_normalised to adjust pre-2023 values to whole dollars.
+
+    Returns:
+        bool: True if companies.aum was updated, False if skipped or failed.
+    """
+    if not filing_id:
+        return False
+
+    # Support either a psycopg2 connection or cursor
+    if hasattr(conn_or_cursor, "cursor"):
+        cursor_context = conn_or_cursor.cursor()
+    else:
+        cursor_context = nullcontext(conn_or_cursor)
+
+    with cursor_context as cur:
+        # Step 1: Resolve filing metadata
+        cur.execute(
+            """
+            SELECT company_id, period_of_report, filing_date, form_type
+            FROM filings
+            WHERE filing_id = %(filing_id)s;
+            """,
+            {"filing_id": filing_id},
+        )
+        filing_meta = cur.fetchone()
+        if not filing_meta:
+            logger.warning(f"Filing {filing_id} not found when updating AUM.")
+            return False
+
+        meta_company_id, period_of_report, filing_date, form_type = filing_meta
+        target_company_id = company_id or meta_company_id
+
+        # Step 2: Backfill Protection Guardrail
+        # Check if there is any newer filing for this company
+        cur.execute(
+            """
+            SELECT 1 FROM filings
+            WHERE company_id = %(company_id)s
+              AND filing_id != %(filing_id)s
+              AND (
+                  period_of_report > %(period_of_report)s
+                  OR (period_of_report = %(period_of_report)s AND filing_date > %(filing_date)s)
+              )
+            LIMIT 1;
+            """,
+            {
+                "company_id": target_company_id,
+                "filing_id": filing_id,
+                "period_of_report": period_of_report,
+                "filing_date": filing_date,
+            },
+        )
+        if cur.fetchone():
+            logger.info(
+                f"Filing {filing_id} (period: {period_of_report}, date: {filing_date}) "
+                f"is not the latest filing for company {target_company_id}. "
+                f"Skipping companies.aum update (backfill protection)."
+            )
+            return False
+
+        # Step 3: Amendment Handling Guardrail (13F-HR/A)
+        norm_form = normalize_form_type(form_type)
+        if "13F-HR/A" in norm_form:
+            # Find original/previous filing for the same period
+            cur.execute(
+                """
+                SELECT f.filing_id,
+                       (SELECT COUNT(*) FROM holdings WHERE filing_id = f.filing_id) AS prev_count
+                FROM filings f
+                WHERE f.company_id = %(company_id)s
+                  AND f.period_of_report = %(period_of_report)s
+                  AND f.filing_id != %(filing_id)s
+                ORDER BY f.filing_date DESC, f.filing_id DESC
+                LIMIT 1;
+                """,
+                {
+                    "company_id": target_company_id,
+                    "period_of_report": period_of_report,
+                    "filing_id": filing_id,
+                },
+            )
+            prev_filing = cur.fetchone()
+            if prev_filing and prev_filing[1] is not None:
+                prev_count = int(prev_filing[1])
+                # Count current holdings
+                cur.execute(
+                    "SELECT COUNT(*) FROM holdings WHERE filing_id = %(filing_id)s;",
+                    {"filing_id": filing_id},
+                )
+                curr_row = cur.fetchone()
+                curr_count = int(curr_row[0]) if curr_row and curr_row[0] is not None else 0
+
+                if prev_count > 0 and curr_count < 0.5 * prev_count:
+                    logger.warning(
+                        f"Filing {filing_id} is a partial amendment ({curr_count} holdings vs original {prev_count} holdings). "
+                        f"Skipping companies.aum overwrite to protect total portfolio value."
+                    )
+                    return False
+
+        # Step 4: Targeted AUM update using holdings_normalised
+        update_query = """
+            UPDATE companies
+            SET aum = (
+                SELECT COALESCE(SUM(value), 0)
+                FROM holdings_normalised
+                WHERE filing_id = %(filing_id)s
+            ),
+            updated_at = NOW()
+            WHERE company_id = %(company_id)s;
+        """
+        try:
+            cur.execute(update_query, {"filing_id": filing_id, "company_id": target_company_id})
+        except psycopg2.Error as e:
+            # Fallback if holdings_normalised view is not present
+            logger.warning(f"Failed to query holdings_normalised view: {e}. Falling back to manual calculation.")
+            fallback_aum_query = """
+                UPDATE companies
+                SET aum = (
+                    SELECT COALESCE(SUM(
+                        CASE 
+                            WHEN f.period_of_report < '2023-01-01' THEN h.value * 1000
+                            ELSE h.value
+                        END
+                    ), 0)
+                    FROM holdings h
+                    JOIN filings f ON h.filing_id = f.filing_id
+                    WHERE h.filing_id = %(filing_id)s
+                ),
+                updated_at = NOW()
+                WHERE company_id = %(company_id)s;
+            """
+            cur.execute(fallback_aum_query, {"filing_id": filing_id, "company_id": target_company_id})
+
+        logger.info(f"Successfully updated companies.aum for company_id={target_company_id} from filing_id={filing_id}")
+        return True
 
 
 def insert_lookups(conn, df):

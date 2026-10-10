@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS companies (
     company_business_state_desc VARCHAR(100),
     company_business_zipcode VARCHAR(20),
     company_phone VARCHAR(50),
+    aum BIGINT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 )
@@ -30,6 +31,8 @@ CREATE TABLE IF NOT EXISTS filings (
     file_number VARCHAR(30) NULL,
     filing_directory VARCHAR(255),
     period_of_report DATE NOT NULL,
+    reported_value_total BIGINT NULL,
+    reported_entry_total INT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 )

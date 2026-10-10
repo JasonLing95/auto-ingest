@@ -22,6 +22,7 @@ from utils import (
     gather_holdings_using_lxml,
     filing_exists,
     gather_data_with_bs4,
+    update_company_aum_post_ingest,
 )
 from get_logger import get_logger
 
@@ -152,6 +153,14 @@ def fetch_new_filing(
 
                         if raw_holdings:
                             insert_holdings_batch(conn, raw_holdings)
+
+                # Event-driven: update company's latest AUM immediately post-ingest
+                try:
+                    update_company_aum_post_ingest(conn, company_id=None, filing_id=new_filing_id)
+                except Exception as aum_err:
+                    logger.error(
+                        f"Error updating company AUM post-ingest for filing {new_filing_id}: {aum_err}"
+                    )
             else:
                 logger.info(
                     f"Filing date {filing_date} is not newer than most recent date {most_recent_date} for CIK {cik_number}"

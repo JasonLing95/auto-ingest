@@ -16,6 +16,8 @@ class Filing:
     file_number: Optional[str] = None
     filing_directory: Optional[str] = None
     reporting_period: Optional[date] = None
+    reported_value_total: Optional[int] = None
+    reported_entry_total: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -39,6 +41,7 @@ class Manager:
     business_address: Optional[Dict[str, Any]] = None
     mailing_address: Optional[Dict[str, Any]] = None
     phone: Optional[str] = None
+    aum: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
