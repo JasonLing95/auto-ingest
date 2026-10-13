@@ -108,7 +108,7 @@ def fetch_new_filing(
 
                 # insert holdings
                 # Looping through attachments to find XML files
-                for attachment in filing.attachments:
+                for attachment in list(filing.attachments):
                     if (
                         attachment.document.endswith(".xml")
                         and "primary_doc" not in attachment.document

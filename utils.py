@@ -285,7 +285,7 @@ def extract_reported_totals(filing: EdgarFiling) -> Tuple[Optional[int], Optiona
 
     # Method 2: Scan attachments for primary_doc.xml
     try:
-        for attachment in getattr(filing, "attachments", []):
+        for attachment in list(getattr(filing, "attachments", [])):
             doc_name = getattr(attachment, "document", "").lower()
             if "primary_doc" in doc_name and doc_name.endswith(".xml"):
                 content = attachment.content
