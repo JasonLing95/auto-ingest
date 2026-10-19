@@ -304,6 +304,58 @@ def extract_reported_totals(filing: EdgarFiling) -> Tuple[Optional[int], Optiona
     return reported_value_total, reported_entry_total
 
 
+def extract_period_of_report(filing: Optional[EdgarFiling]) -> Optional[str]:
+    """Extracts period_of_report with fallback to primary_doc.xml if SGML header is missing it."""
+    if not filing:
+        return None
+
+    import re
+
+    def _normalize_date_str(val: str) -> Optional[str]:
+        val = val.strip()
+        if not val:
+            return None
+        for fmt in ("%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y", "%Y%m%d"):
+            try:
+                return dt.datetime.strptime(val, fmt).date().isoformat()
+            except ValueError:
+                continue
+        return val
+
+    try:
+        por = getattr(filing, "period_of_report", None)
+        if por:
+            if hasattr(por, "isoformat"):
+                return por.isoformat()
+            normalized = _normalize_date_str(str(por))
+            if normalized:
+                return normalized
+    except Exception:
+        pass
+
+    if hasattr(filing, "attachments"):
+        try:
+            for attachment in list(getattr(filing, "attachments", [])):
+                doc_name = getattr(attachment, "document", "").lower()
+                if "primary" in doc_name or doc_name.endswith(".xml"):
+                    content = attachment.content
+                    if content:
+                        if isinstance(content, bytes):
+                            content = content.decode("utf-8", errors="ignore")
+                        for tag in ("periodOfReport", "reportCalendarOrQuarter"):
+                            match = re.search(
+                                rf"<{tag}>(.*?)</{tag}>", content, re.IGNORECASE
+                            )
+                            if match and match.group(1).strip():
+                                normalized = _normalize_date_str(match.group(1))
+                                if normalized:
+                                    return normalized
+        except Exception as e:
+            logger.warning(f"Could not extract fallback period_of_report from XML: {e}")
+
+    return None
+
+
 def insert_filing(
     conn: psycopg2.extensions.connection, cik: str, filing: EdgarFiling
 ) -> Optional[int]:
@@ -314,10 +366,7 @@ def insert_filing(
     except ArithmeticError:
         filing_date = None
 
-    try:
-        period_of_report = filing.period_of_report  # in str format
-    except ArithmeticError:
-        period_of_report = None
+    period_of_report = extract_period_of_report(filing)
 
     filing_form_type = normalize_form_type(getattr(filing, "form", None))
 
