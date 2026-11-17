@@ -362,8 +362,12 @@ def insert_filing(
     accession_number = filing.accession_number
 
     try:
-        filing_date = filing.filing_date.isoformat()  # type: ignore
-    except ArithmeticError:
+        filing_date = (
+            filing.filing_date.isoformat()
+            if hasattr(filing.filing_date, "isoformat")
+            else str(filing.filing_date)
+        )
+    except Exception:
         filing_date = None
 
     period_of_report = extract_period_of_report(filing)
@@ -372,12 +376,12 @@ def insert_filing(
 
     try:
         file_number = filing.file_number  # type: ignore
-    except AttributeError:
+    except Exception:
         file_number = None
 
     try:
         file_dir = filing.filing_directory.name
-    except ArithmeticError:
+    except Exception:
         file_dir = None
 
     reported_value_total, reported_entry_total = extract_reported_totals(filing)
@@ -870,3 +874,88 @@ def filing_exists(conn, accession_number) -> bool:
 
     # Return the boolean value from the query result.
     return result[0] if result else False
+
+
+def get_active_quarter_end(today: Optional[dt.date] = None) -> dt.date:
+    """Return the most recently completed calendar quarter-end date on or before ``today``."""
+    current_date = today or dt.date.today()
+    if isinstance(current_date, dt.datetime):
+        current_date = current_date.date()
+    month = current_date.month
+    if month in (1, 2, 3):
+        return dt.date(current_date.year - 1, 12, 31)
+    elif month in (4, 5, 6):
+        return dt.date(current_date.year, 3, 31)
+    elif month in (7, 8, 9):
+        return dt.date(current_date.year, 6, 30)
+    else:
+        return dt.date(current_date.year, 9, 30)
+
+
+def prioritize_ciks(
+    conn: psycopg2.extensions.connection,
+    ciks: List[str],
+    today: Optional[dt.date] = None,
+) -> List[str]:
+    """Order CIKs by unfiled active-quarter status first, then by companies.aum DESC NULLS LAST.
+
+    Priority 1: CIKs that have NOT yet filed a 13F-HR for the active quarter, ordered by AUM DESC NULLS LAST.
+    Priority 2: CIKs that HAVE already filed a 13F-HR for the active quarter, ordered by AUM DESC NULLS LAST.
+    """
+    cleaned_ciks = [str(c).strip() for c in ciks if str(c).strip()]
+    if not cleaned_ciks:
+        return []
+
+    active_quarter_end = get_active_quarter_end(today=today)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    c.cik_number,
+                    c.aum,
+                    EXISTS (
+                        SELECT 1
+                        FROM filings f
+                        WHERE f.company_id = c.company_id
+                          AND f.form_type = '13F-HR'
+                          AND f.period_of_report >= %s
+                    ) AS has_filed_active_quarter
+                FROM companies c
+                WHERE c.cik_number = ANY(%s);
+                """,
+                (active_quarter_end, cleaned_ciks),
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        logger.warning(f"Failed to prioritize CIK queue from database, using existing order: {e}")
+        return cleaned_ciks
+
+    db_info = {}
+    for cik_num, aum_val, has_filed in rows:
+        if cik_num is not None:
+            db_info[str(cik_num).strip()] = (
+                int(aum_val) if aum_val is not None else None,
+                bool(has_filed),
+            )
+
+    def _sort_key(item: Tuple[int, str]) -> Tuple[int, int, int, int]:
+        idx, cik_str = item
+        aum_val, has_filed = db_info.get(cik_str, (None, False))
+        priority_group = 1 if has_filed else 0
+        aum_null_rank = 0 if aum_val is not None else 1
+        neg_aum = -(aum_val or 0)
+        return (priority_group, aum_null_rank, neg_aum, idx)
+
+    prioritized = [
+        cik_str for _, cik_str in sorted(enumerate(cleaned_ciks), key=_sort_key)
+    ]
+    unfiled_count = sum(
+        1 for c in prioritized if not db_info.get(c, (None, False))[1]
+    )
+    logger.info(
+        f"Prioritized {len(prioritized)} CIKs for active quarter >= {active_quarter_end}: "
+        f"{unfiled_count} unfiled (Priority 1), {len(prioritized) - unfiled_count} filed (Priority 2)."
+    )
+    return prioritized
+

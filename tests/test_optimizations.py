@@ -1,10 +1,20 @@
 import datetime as dt
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from main import compute_query_start_date, fetch_new_filing
-from utils import insert_holdings_batch
+import httpx
+
+import main as main_module
+from main import (
+    compute_query_start_date,
+    configure_edgar_http_timeout,
+    fetch_new_filing,
+    heartbeat,
+    run_daily_index_sweep,
+)
+from utils import get_active_quarter_end, insert_holdings_batch, prioritize_ciks
 
 
 class TestQueryStartDate(unittest.TestCase):
@@ -166,6 +176,113 @@ class TestFetchNewFilingLogging(unittest.TestCase):
 
         joined = "\n".join(cm.output)
         self.assertIn("No new filings ingested for CIK 2007591", joined)
+
+
+class TestEdgarHttpTimeout(unittest.TestCase):
+    @patch("main.httpclient.close_clients")
+    def test_configure_edgar_http_timeout_sets_params_and_closes_clients(
+        self, mock_close_clients
+    ):
+        timeout = configure_edgar_http_timeout(read_timeout=30.0, connect_timeout=10.0)
+        self.assertIsInstance(timeout, httpx.Timeout)
+        self.assertEqual(timeout.read, 30.0)
+        self.assertEqual(timeout.connect, 10.0)
+        self.assertEqual(main_module.httpclient.HTTP_MGR.httpx_params["timeout"], timeout)
+        if hasattr(main_module.httpclient, "DEFAULT_PARAMS"):
+            self.assertEqual(main_module.httpclient.DEFAULT_PARAMS["timeout"], timeout)
+        mock_close_clients.assert_called_once()
+
+
+class TestPrioritizeCiks(unittest.TestCase):
+    def test_get_active_quarter_end(self):
+        self.assertEqual(get_active_quarter_end(dt.date(2026, 2, 15)), dt.date(2025, 12, 31))
+        self.assertEqual(get_active_quarter_end(dt.date(2026, 5, 15)), dt.date(2026, 3, 31))
+        self.assertEqual(get_active_quarter_end(dt.date(2026, 8, 15)), dt.date(2026, 6, 30))
+        self.assertEqual(get_active_quarter_end(dt.date(2026, 11, 16)), dt.date(2026, 9, 30))
+
+    def test_prioritize_ciks_unfiled_before_filed_and_aum_desc(self):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+        # Simulate DB rows: (cik_number, aum, has_filed_active_quarter)
+        mock_cursor.fetchall.return_value = [
+            ("111", 5_000_000_000, True),     # filed, high AUM -> Priority 2
+            ("222", 100_000_000, False),      # unfiled, lower AUM -> Priority 1 (#2)
+            ("333", 900_000_000_000, False),  # unfiled, highest AUM -> Priority 1 (#1)
+            ("444", None, False),             # unfiled, NULL AUM -> Priority 1 (after non-null AUMs)
+            ("555", 10_000_000_000, True),    # filed, higher AUM -> Priority 2 (#1 in P2)
+        ]
+
+        input_ciks = ["111", "222", "333", "666", "444", "555"]
+        result = prioritize_ciks(mock_conn, input_ciks, today=dt.date(2026, 11, 16))
+
+        # 666 has no DB row -> treated as (aum=None, has_filed=False), preserves input order vs 444
+        self.assertEqual(result, ["333", "222", "666", "444", "555", "111"])
+
+        executed_sql, params = mock_cursor.execute.call_args[0]
+        self.assertIn("period_of_report >= %s", executed_sql)
+        self.assertEqual(params[0], dt.date(2026, 9, 30))
+
+    def test_prioritize_ciks_db_error_falls_back_to_original_order(self):
+        mock_conn = MagicMock()
+        mock_conn.cursor.side_effect = RuntimeError("DB unavailable")
+        input_ciks = ["1067983", "735286", "93751"]
+        self.assertEqual(prioritize_ciks(mock_conn, input_ciks), input_ciks)
+
+
+class _StopLoop(Exception):
+    pass
+
+
+class TestHeartbeat(unittest.TestCase):
+    @patch("main.requests.get")
+    @patch("main.time.sleep", side_effect=_StopLoop)
+    def test_heartbeat_pings_when_main_loop_active(self, _mock_sleep, mock_get):
+        main_module.LAST_MAIN_LOOP_TIMESTAMP = time.time()
+        with self.assertRaises(_StopLoop):
+            heartbeat()
+        mock_get.assert_called_once_with(main_module.HEALTHCHECK_URL, timeout=10)
+
+    @patch("main.requests.get")
+    @patch("main.time.sleep", side_effect=_StopLoop)
+    def test_heartbeat_suppresses_ping_when_inactive(self, _mock_sleep, mock_get):
+        main_module.LAST_MAIN_LOOP_TIMESTAMP = time.time() - 300
+        with self.assertLogs("main", level="WARNING") as cm:
+            with self.assertRaises(_StopLoop):
+                heartbeat()
+        mock_get.assert_not_called()
+        self.assertIn("Suppressing heartbeat ping", "\n".join(cm.output))
+
+
+class TestDailyIndexSweep(unittest.TestCase):
+    @patch("main.ingest_single_filing", return_value=True)
+    @patch("main.get_filings")
+    def test_index_sweep_filters_to_relevant_ciks(self, mock_get_filings, mock_ingest):
+        matching_filing = SimpleNamespace(
+            cik=1067983,
+            accession_number="0001193125-26-463399",
+            filing_date="2026-11-16",
+        )
+        non_matching_filing = SimpleNamespace(
+            cik=9999999,
+            accession_number="0009999999-26-000001",
+            filing_date="2026-11-16",
+        )
+        mock_get_filings.return_value = [matching_filing, non_matching_filing]
+
+        mock_conn = MagicMock()
+        ingested = run_daily_index_sweep(
+            mock_conn,
+            relevant_ciks={"1067983"},
+            filing_date_str="2026-11-16",
+        )
+
+        self.assertEqual(ingested, 1)
+        mock_get_filings.assert_called_once_with(
+            form=main_module.VALID_FORMS, filing_date="2026-11-16"
+        )
+        mock_ingest.assert_called_once_with(mock_conn, "1067983", matching_filing)
 
 
 if __name__ == "__main__":
