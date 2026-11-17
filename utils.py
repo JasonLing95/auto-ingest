@@ -738,8 +738,12 @@ def insert_holdings_batch(
     holdings = pd.DataFrame(holdings, columns=HOLDINGS_COLUMNS)
     holdings["cusip"] = holdings["cusip"].apply(normalize_cusip)
 
+    accession_numbers = holdings["accession_number"].dropna().unique().tolist()
     with conn.cursor() as cur:
-        cur.execute("SELECT accession_number, filing_id FROM filings")
+        cur.execute(
+            "SELECT accession_number, filing_id FROM filings WHERE accession_number = ANY(%s)",
+            (accession_numbers,),
+        )
         filing_map = {row[0]: row[1] for row in cur.fetchall()}
 
     lookup_mappings = insert_lookups(conn, holdings)

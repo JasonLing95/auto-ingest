@@ -13,6 +13,7 @@ from httpx import HTTPStatusError
 from lxml import etree  # type: ignore
 import psycopg2
 import sys
+from typing import Optional
 
 from utils import (
     connect_db,
@@ -36,6 +37,28 @@ HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "https://example.com/healthcheck"
 MAX_RETRIES = 3
 VALID_FORMS = ["13F-HR", "13F-HR/A", "13F-HR/A/A"]  # Valid forms to fetch filings for
 DUCKDB_PATH = os.getenv("DUCKDB_PATH", "edgar_db.db")
+
+
+def compute_query_start_date(
+    latest_filing_date: Optional[dt.date],
+    today: Optional[dt.date] = None,
+) -> dt.date:
+    """Return the EDGAR query start date for a CIK.
+
+    Advances past ``latest_filing_date`` by 1 day when strictly older than
+    yesterday so EDGAR's inclusive date filter does not re-fetch already-ingested
+    filings on every cycle, while keeping yesterday/today inclusive so same-day
+    amendments or multi-filing batches are not missed.
+    """
+    current_date = today or dt.date.today()
+    if not latest_filing_date:
+        return current_date - dt.timedelta(days=730)
+    if isinstance(latest_filing_date, dt.datetime):
+        latest_filing_date = latest_filing_date.date()
+    yesterday = current_date - dt.timedelta(days=1)
+    if latest_filing_date < yesterday:
+        return latest_filing_date + dt.timedelta(days=1)
+    return min(latest_filing_date, current_date)
 
 
 def find_namespaces(tree):
@@ -88,8 +111,8 @@ def fetch_new_filing(
                 )
                 return
 
+            ingested_count = 0
             for filing in filings:
-                filing_date = filing.filing_date
                 accession_number = filing.accession_number
 
                 # check if filing in database
@@ -105,6 +128,8 @@ def fetch_new_filing(
                         f"Filing {accession_number} already handled concurrently; skipping holdings."
                     )
                     continue
+
+                ingested_count += 1
 
                 # insert holdings
                 # Looping through attachments to find XML files
@@ -161,9 +186,9 @@ def fetch_new_filing(
                     logger.error(
                         f"Error updating company AUM post-ingest for filing {new_filing_id}: {aum_err}"
                     )
-            else:
+            if ingested_count == 0:
                 logger.info(
-                    f"Filing date {filing_date} is not newer than most recent date {most_recent_date} for CIK {cik_number}"
+                    f"No new filings ingested for CIK {cik_number} since {most_recent_date} (checked {len(filings)} filings)."
                 )
 
             return
@@ -217,11 +242,11 @@ def main(conn, cik_queue: deque):
                 logger.info(
                     f"Most recent filing date for {cik}: {latest_filing_date_in_db}"
                 )
-                fetch_new_filing(conn, cik, latest_filing_date_in_db)
             else:
                 logger.info(f"No filings found for {cik}. Fetching all available.")
-                start_date = dt.date.today() - dt.timedelta(days=730)
-                fetch_new_filing(conn, cik, start_date)
+
+            start_date = compute_query_start_date(latest_filing_date_in_db)
+            fetch_new_filing(conn, cik, start_date)
 
             try:
                 requests.get(HEALTHCHECK_URL, timeout=10)
