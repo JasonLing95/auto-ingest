@@ -1,4 +1,8 @@
 from edgar import set_identity, Company, get_filings, httpclient
+from edgar import _filings as edgar_filings
+from edgar.httprequests import get_with_retry, inspect_response
+import gzip
+from io import BytesIO
 import httpx
 import random
 import datetime as dt
@@ -29,6 +33,7 @@ from utils import (
     prioritize_ciks,
     get_existing_accession_numbers,
     cleanup_empty_recent_filings,
+    release_unused_memory,
 )
 from get_logger import get_logger
 
@@ -64,6 +69,52 @@ def configure_edgar_http_timeout(
 
 
 configure_edgar_http_timeout()
+
+_ORIG_FETCH_FILING_INDEX_AT_URL = getattr(
+    edgar_filings, "fetch_filing_index_at_url", None
+)
+_ORIG_READ_INDEX_FILE = getattr(edgar_filings, "read_index_file", None)
+
+
+def _stream_fetch_filing_index_at_url(url: str, index: str):
+    """Stream-decompress quarterly form.gz index and pre-filter to 13F lines to save ~85-105 MB RSS."""
+    if (
+        index == "form"
+        and isinstance(url, str)
+        and url.endswith("gz")
+        and _ORIG_READ_INDEX_FILE is not None
+    ):
+        try:
+            response = get_with_retry(url=url)
+            inspect_response(response)
+            kept = ["-----"]
+            with gzip.open(
+                BytesIO(response.content), "rt", encoding="utf-8", errors="replace"
+            ) as gz:
+                for line in gz:
+                    if line.startswith("13F"):
+                        kept.append(line.rstrip("\r\n"))
+            del response
+            return _ORIG_READ_INDEX_FILE(
+                "\n".join(kept),
+                form_column=getattr(edgar_filings, "FORM_INDEX_FORM_COLUMN", 0),
+            )
+        except Exception as e:
+            logger.warning(
+                f"Streaming index pre-filter failed for {url}, falling back to default loader: {e}"
+            )
+    if _ORIG_FETCH_FILING_INDEX_AT_URL is not None:
+        return _ORIG_FETCH_FILING_INDEX_AT_URL(url, index)
+    return None
+
+
+def configure_edgar_index_prefilter() -> None:
+    """Install the streaming 13F pre-filter on edgar._filings.fetch_filing_index_at_url."""
+    if hasattr(edgar_filings, "fetch_filing_index_at_url"):
+        edgar_filings.fetch_filing_index_at_url = _stream_fetch_filing_index_at_url
+
+
+configure_edgar_index_prefilter()
 
 HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "https://example.com/healthcheck")
 MAX_RETRIES = 3
@@ -230,6 +281,7 @@ def ingest_single_filing(conn, cik_number: str, filing) -> bool:
             f"No holdings extracted for filing {accession_number} (ID {new_filing_id}); skipping companies.aum update."
         )
 
+    release_unused_memory()
     return True
 
 
@@ -283,6 +335,8 @@ def run_daily_index_sweep(
         f"Bulk daily index sweep complete: checked {len(candidates)} relevant filings "
         f"({len(existing_accessions)} already in DB), ingested {ingested} new filings."
     )
+    del filings, candidates
+    release_unused_memory()
     return ingested
 
 
@@ -416,6 +470,8 @@ def main(conn, cik_queue: deque):
 
         cik_queue.append(cik)
         cycle_remaining -= 1
+        if cycle_remaining % 50 == 0:
+            release_unused_memory()
         if cycle_remaining <= 0 and base_ciks:
             cleanup_empty_recent_filings(conn)
             cik_queue = deque(prioritize_ciks(conn, base_ciks))

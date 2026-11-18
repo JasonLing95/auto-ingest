@@ -1,4 +1,5 @@
 import datetime as dt
+import gzip
 import time
 import unittest
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ import httpx
 
 import main as main_module
 from main import (
+    _stream_fetch_filing_index_at_url,
     compute_query_start_date,
     configure_edgar_http_timeout,
     fetch_new_filing,
@@ -21,6 +23,7 @@ from utils import (
     get_existing_accession_numbers,
     insert_holdings_batch,
     prioritize_ciks,
+    release_unused_memory,
 )
 
 
@@ -425,6 +428,50 @@ class TestAccessionHelpers(unittest.TestCase):
         self.assertIn("DELETE FROM filings f", sql)
         self.assertIn("NOT EXISTS", sql)
         self.assertIn("Cleaned up 2 empty recent filings", "\n".join(cm.output))
+
+
+class TestMemoryOptimizations(unittest.TestCase):
+    @patch("main.inspect_response")
+    @patch("main.get_with_retry")
+    def test_stream_index_prefilter_keeps_only_13f_rows(
+        self, mock_get_with_retry, _mock_inspect
+    ):
+        sample_idx = "\n".join(
+            [
+                "Description: Form Index",
+                "Form Type   Company Name                              CIK         Date Filed  File Name",
+                "-----------------------------------------------------------------------------------------------",
+                "4           SOME INSIDER                              123456      2026-11-16  edgar/data/123456/0000123456-26-000001.txt",
+                "8-K         APPLE INC                                 320193      2026-11-16  edgar/data/320193/0000320193-26-000002.txt",
+                "13F-HR      BERKSHIRE HATHAWAY INC                    1067983     2026-11-16  edgar/data/1067983/0001193125-26-463399.txt",
+                "13F-HR/A    BLACKROCK INC                             1364742     2026-11-17  edgar/data/1364742/0001086364-26-000003.txt",
+            ]
+        )
+        compressed = gzip.compress(sample_idx.encode("utf-8"))
+        mock_get_with_retry.return_value = SimpleNamespace(content=compressed)
+
+        table = _stream_fetch_filing_index_at_url(
+            "https://www.sec.gov/Archives/edgar/full-index/2026/QTR4/form.gz",
+            "form",
+        )
+
+        self.assertIsNotNone(table)
+        self.assertEqual(table.num_rows, 2)
+        self.assertEqual(table["form"].to_pylist(), ["13F-HR", "13F-HR/A"])
+        self.assertEqual(table["cik"].to_pylist(), [1067983, 1364742])
+        self.assertEqual(
+            table["accession_number"].to_pylist(),
+            ["0001193125-26-463399", "0001086364-26-000003"],
+        )
+
+    def test_release_unused_memory_clears_edgar_caches_safely(self):
+        from edgar import entity as edgar_entity
+
+        mock_fn = MagicMock()
+        mock_fn.cache_clear = MagicMock()
+        with patch.object(edgar_entity, "get_entity_submissions", mock_fn):
+            release_unused_memory()
+        mock_fn.cache_clear.assert_called_once()
 
 
 if __name__ == "__main__":

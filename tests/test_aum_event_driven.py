@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
 from utils import (
@@ -43,6 +43,35 @@ class TestAumEventDriven(unittest.TestCase):
         val_total, entry_total = extract_reported_totals(mock_filing)
         self.assertIsNone(val_total)
         self.assertIsNone(entry_total)
+
+    @patch("edgar.thirteenf.ThirteenF")
+    def test_extract_reported_totals_skips_thirteenf_when_primary_doc_present(
+        self, mock_thirteenf_cls
+    ):
+        """Test that primary_doc.xml totals avoid instantiating ThirteenF (and loading SGML/related_filings)."""
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+        <edgarSubmission>
+            <formData>
+                <summaryPage>
+                    <tableEntryTotal>120</tableEntryTotal>
+                    <tableValueTotal>987654321</tableValueTotal>
+                </summaryPage>
+            </formData>
+        </edgarSubmission>
+        """
+        mock_attachment = SimpleNamespace(
+            document="primary_doc.xml",
+            content=xml_content,
+        )
+        mock_filing = SimpleNamespace(
+            attachments=[mock_attachment],
+            form="13F-HR",
+        )
+
+        val_total, entry_total = extract_reported_totals(mock_filing)
+        self.assertEqual(val_total, 987654321)
+        self.assertEqual(entry_total, 120)
+        mock_thirteenf_cls.assert_not_called()
 
     def test_update_company_aum_standard(self):
         """Test standard AUM update when filing is the latest."""

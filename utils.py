@@ -1,5 +1,7 @@
 import os
 import sys
+import gc
+import ctypes
 import psycopg2
 from typing import List, Optional, Tuple
 from contextlib import nullcontext
@@ -269,21 +271,7 @@ def extract_reported_totals(filing: EdgarFiling) -> Tuple[Optional[int], Optiona
     reported_value_total = None
     reported_entry_total = None
 
-    # Method 1: Try edgartools ThirteenF parser
-    try:
-        from edgar.thirteenf import ThirteenF
-
-        thirteen_f = ThirteenF(filing)
-        if thirteen_f.total_value is not None:
-            reported_value_total = int(float(thirteen_f.total_value))
-        if thirteen_f.total_holdings is not None:
-            reported_entry_total = int(thirteen_f.total_holdings)
-        if reported_value_total is not None and reported_entry_total is not None:
-            return reported_value_total, reported_entry_total
-    except Exception:
-        pass
-
-    # Method 2: Scan attachments for primary_doc.xml
+    # Method 1: Scan attachments for primary_doc.xml directly (avoids loading full SGML / related_filings)
     try:
         for attachment in list(getattr(filing, "attachments", [])):
             doc_name = getattr(attachment, "document", "").lower()
@@ -298,6 +286,21 @@ def extract_reported_totals(filing: EdgarFiling) -> Tuple[Optional[int], Optiona
                     if entry_el and entry_el.text and entry_el.text.strip():
                         reported_entry_total = int(float(entry_el.text.strip()))
                     break
+    except Exception:
+        pass
+
+    if reported_value_total is not None and reported_entry_total is not None:
+        return reported_value_total, reported_entry_total
+
+    # Method 2: Fallback to edgartools ThirteenF parser
+    try:
+        from edgar.thirteenf import ThirteenF
+
+        thirteen_f = ThirteenF(filing)
+        if reported_value_total is None and thirteen_f.total_value is not None:
+            reported_value_total = int(float(thirteen_f.total_value))
+        if reported_entry_total is None and thirteen_f.total_holdings is not None:
+            reported_entry_total = int(thirteen_f.total_holdings)
     except Exception:
         pass
 
@@ -1011,4 +1014,62 @@ def prioritize_ciks(
         f"{unfiled_count} unfiled (Priority 1), {len(prioritized) - unfiled_count} filed (Priority 2)."
     )
     return prioritized
+
+
+def release_unused_memory() -> None:
+    """Clear edgartools in-memory LRU caches and return unused PyArrow/glibc heap pages to the OS."""
+    try:
+        import edgar
+        from edgar import entity as edgar_entity
+        from edgar import thirteenf as edgar_thirteenf
+        from edgar import _filings as edgar_filings
+
+        cache_targets = [
+            getattr(edgar_entity, "get_entity_submissions", None),
+            getattr(edgar_entity, "download_entity_submissions_from_sec", None),
+            getattr(edgar_entity, "find_company", None),
+            getattr(edgar, "find", None),
+            getattr(edgar_thirteenf.ThirteenF, "parse_primary_document_xml", None),
+            getattr(edgar_thirteenf.ThirteenF, "previous_holding_report", None),
+        ]
+        for cls_name in ("Filing", "CompanyFiling", "EntityFiling"):
+            for mod in (edgar, edgar_entity, edgar_filings):
+                cls_obj = getattr(mod, cls_name, None)
+                if cls_obj is not None:
+                    for method_name in (
+                        "html",
+                        "xml",
+                        "text",
+                        "related_filings",
+                        "as_company_filing",
+                        "get_entity",
+                        "sections",
+                    ):
+                        cache_targets.append(getattr(cls_obj, method_name, None))
+
+        for fn in cache_targets:
+            if fn is not None and hasattr(fn, "cache_clear") and callable(fn.cache_clear):
+                try:
+                    fn.cache_clear()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    gc.collect()
+
+    try:
+        import pyarrow as pa
+
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        if hasattr(libc, "malloc_trim"):
+            libc.malloc_trim(0)
+    except Exception:
+        pass
+
 
