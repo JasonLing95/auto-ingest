@@ -602,7 +602,10 @@ def update_company_aum_post_ingest(
                 WHERE filing_id = %(filing_id)s
             ),
             updated_at = NOW()
-            WHERE company_id = %(company_id)s;
+            WHERE company_id = %(company_id)s
+              AND EXISTS (
+                  SELECT 1 FROM holdings WHERE filing_id = %(filing_id)s
+              );
         """
         try:
             cur.execute(update_query, {"filing_id": filing_id, "company_id": target_company_id})
@@ -623,7 +626,10 @@ def update_company_aum_post_ingest(
                     WHERE h.filing_id = %(filing_id)s
                 ),
                 updated_at = NOW()
-                WHERE company_id = %(company_id)s;
+                WHERE company_id = %(company_id)s
+                  AND EXISTS (
+                      SELECT 1 FROM holdings WHERE filing_id = %(filing_id)s
+                  );
             """
             cur.execute(fallback_aum_query, {"filing_id": filing_id, "company_id": target_company_id})
 
@@ -874,6 +880,53 @@ def filing_exists(conn, accession_number) -> bool:
 
     # Return the boolean value from the query result.
     return result[0] if result else False
+
+
+def get_existing_accession_numbers(
+    conn: psycopg2.extensions.connection,
+    accession_numbers: List[str],
+) -> set[str]:
+    """Return the subset of accession_numbers that already exist in the filings table."""
+    cleaned = [str(a).strip() for a in accession_numbers if str(a).strip()]
+    if not cleaned:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT accession_number FROM filings WHERE accession_number = ANY(%s);",
+            (cleaned,),
+        )
+        return {row[0] for row in cur.fetchall() if row and row[0]}
+
+
+def cleanup_empty_recent_filings(
+    conn: psycopg2.extensions.connection,
+    lookback_days: int = 30,
+) -> int:
+    """Delete recent filings that have 0 rows in holdings (older than 5 minutes) so they can be re-ingested cleanly."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM filings f
+                WHERE f.filing_date >= CURRENT_DATE - (%s * INTERVAL '1 day')
+                  AND f.created_at < NOW() - INTERVAL '5 minutes'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM holdings h WHERE h.filing_id = f.filing_id
+                  )
+                RETURNING f.filing_id, f.accession_number;
+                """,
+                (lookback_days,),
+            )
+            deleted = cur.fetchall()
+            if deleted:
+                logger.warning(
+                    f"Cleaned up {len(deleted)} empty recent filings with 0 holdings for re-ingestion: "
+                    f"{[row[1] for row in deleted[:15]]}"
+                )
+            return len(deleted)
+    except Exception as e:
+        logger.warning(f"Failed to clean up empty recent filings: {e}")
+        return 0
 
 
 def get_active_quarter_end(today: Optional[dt.date] = None) -> dt.date:

@@ -12,9 +12,16 @@ from main import (
     configure_edgar_http_timeout,
     fetch_new_filing,
     heartbeat,
+    ingest_single_filing,
     run_daily_index_sweep,
 )
-from utils import get_active_quarter_end, insert_holdings_batch, prioritize_ciks
+from utils import (
+    cleanup_empty_recent_filings,
+    get_active_quarter_end,
+    get_existing_accession_numbers,
+    insert_holdings_batch,
+    prioritize_ciks,
+)
 
 
 class TestQueryStartDate(unittest.TestCase):
@@ -283,6 +290,141 @@ class TestDailyIndexSweep(unittest.TestCase):
             form=main_module.VALID_FORMS, filing_date="2026-11-16"
         )
         mock_ingest.assert_called_once_with(mock_conn, "1067983", matching_filing)
+
+    @patch("main.ingest_single_filing", return_value=True)
+    @patch("main.get_existing_accession_numbers", return_value={"0001193125-26-463399"})
+    @patch("main.get_filings")
+    def test_index_sweep_batch_filters_existing_accessions(
+        self, mock_get_filings, mock_get_existing, mock_ingest
+    ):
+        existing_filing = SimpleNamespace(
+            cik=1067983,
+            accession_number="0001193125-26-463399",
+            filing_date="2026-11-16",
+        )
+        new_filing = SimpleNamespace(
+            cik=1446194,
+            accession_number="0001446194-26-000009",
+            filing_date="2026-11-17",
+        )
+        mock_get_filings.return_value = [existing_filing, new_filing]
+
+        mock_conn = MagicMock()
+        ingested = run_daily_index_sweep(
+            mock_conn,
+            relevant_ciks={"1067983", "1446194"},
+            filing_date_str="2026-11-16:2026-11-17",
+        )
+
+        self.assertEqual(ingested, 1)
+        mock_get_existing.assert_called_once_with(
+            mock_conn, ["0001193125-26-463399", "0001446194-26-000009"]
+        )
+        mock_ingest.assert_called_once_with(mock_conn, "1446194", new_filing)
+
+
+class TestUppercaseXmlAndAumGuard(unittest.TestCase):
+    @patch("main.update_company_aum_post_ingest")
+    @patch("main.insert_holdings_batch")
+    @patch("main.insert_filing", return_value=347308)
+    @patch("main.filing_exists", return_value=False)
+    def test_ingest_processes_uppercase_xml_extensions(
+        self, _mock_exists, _mock_insert_filing, mock_insert_holdings, mock_update_aum
+    ):
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <informationTable xmlns="http://www.sec.gov/edgar/document/thirteenf/informationtable">
+            <infoTable>
+                <nameOfIssuer>CISCO SYS INC</nameOfIssuer>
+                <titleOfClass>COM</titleOfClass>
+                <cusip>17275R102</cusip>
+                <value>1000</value>
+                <shrsOrPrnAmt><sshPrnamt>100</sshPrnamt><sshPrnamtType>SH</sshPrnamtType></shrsOrPrnAmt>
+                <investmentDiscretion>SOLE</investmentDiscretion>
+                <votingAuthority><Sole>100</Sole><Shared>0</Shared><None>0</None></votingAuthority>
+            </infoTable>
+        </informationTable>"""
+        primary_doc = SimpleNamespace(
+            document="primary_doc.xml",
+            document_type="13F-HR",
+            url="https://example.com/primary_doc.xml",
+            content="<edgarSubmission></edgarSubmission>",
+        )
+        info_table_upper = SimpleNamespace(
+            document="file.XML",
+            document_type="INFORMATION TABLE",
+            url="https://example.com/file.XML",
+            content=xml,
+        )
+        filing = SimpleNamespace(
+            accession_number="0001446194-26-000009",
+            attachments=[primary_doc, info_table_upper],
+        )
+
+        mock_conn = MagicMock()
+        result = ingest_single_filing(mock_conn, "1446194", filing)
+
+        self.assertTrue(result)
+        mock_insert_holdings.assert_called_once()
+        mock_update_aum.assert_called_once_with(mock_conn, company_id=None, filing_id=347308)
+
+    @patch("main.update_company_aum_post_ingest")
+    @patch("main.insert_holdings_batch")
+    @patch("main.insert_filing", return_value=347999)
+    @patch("main.filing_exists", return_value=False)
+    def test_ingest_skips_aum_update_when_no_holdings_inserted(
+        self, _mock_exists, _mock_insert_filing, mock_insert_holdings, mock_update_aum
+    ):
+        primary_doc = SimpleNamespace(
+            document="primary_doc.xml",
+            document_type="13F-HR",
+            url="https://example.com/primary_doc.xml",
+            content="<edgarSubmission></edgarSubmission>",
+        )
+        filing = SimpleNamespace(
+            accession_number="0001446194-26-000999",
+            attachments=[primary_doc],
+        )
+
+        mock_conn = MagicMock()
+        with self.assertLogs("main", level="WARNING") as cm:
+            result = ingest_single_filing(mock_conn, "1446194", filing)
+
+        self.assertTrue(result)
+        mock_insert_holdings.assert_not_called()
+        mock_update_aum.assert_not_called()
+        self.assertIn("skipping companies.aum update", "\n".join(cm.output))
+
+
+class TestAccessionHelpers(unittest.TestCase):
+    def test_get_existing_accession_numbers(self):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_cursor.fetchall.return_value = [("0001193125-26-463399",)]
+
+        res = get_existing_accession_numbers(
+            mock_conn, ["0001193125-26-463399", "0001446194-26-000009"]
+        )
+        self.assertEqual(res, {"0001193125-26-463399"})
+        self.assertEqual(get_existing_accession_numbers(mock_conn, []), set())
+
+    def test_cleanup_empty_recent_filings(self):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_cursor.fetchall.return_value = [
+            (347015, "0001905128-26-000007"),
+            (347308, "0001446194-26-000009"),
+        ]
+
+        with self.assertLogs("utils", level="WARNING") as cm:
+            deleted = cleanup_empty_recent_filings(mock_conn, lookback_days=30)
+
+        self.assertEqual(deleted, 2)
+        sql = mock_cursor.execute.call_args[0][0]
+        self.assertIn("DELETE FROM filings f", sql)
+        self.assertIn("NOT EXISTS", sql)
+        self.assertIn("Cleaned up 2 empty recent filings", "\n".join(cm.output))
 
 
 if __name__ == "__main__":

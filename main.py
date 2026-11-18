@@ -27,6 +27,8 @@ from utils import (
     gather_data_with_bs4,
     update_company_aum_post_ingest,
     prioritize_ciks,
+    get_existing_accession_numbers,
+    cleanup_empty_recent_filings,
 )
 from get_logger import get_logger
 
@@ -166,10 +168,13 @@ def ingest_single_filing(conn, cik_number: str, filing) -> bool:
         )
         return False
 
+    holdings_inserted = False
     for attachment in list(filing.attachments):
-        if (
-            attachment.document.endswith(".xml")
-            and "primary_doc" not in attachment.document
+        doc_name_lower = getattr(attachment, "document", "").lower()
+        doc_type_upper = getattr(attachment, "document_type", "").upper()
+        if doc_name_lower.endswith(".xml") and (
+            "primary_doc" not in doc_name_lower
+            or "INFORMATION TABLE" in doc_type_upper
         ):
             logger.info(f"Processing XML attachment: {attachment.url}")
             assert attachment.content
@@ -209,14 +214,20 @@ def ingest_single_filing(conn, cik_number: str, filing) -> bool:
 
             if raw_holdings:
                 insert_holdings_batch(conn, raw_holdings)
+                holdings_inserted = True
             update_heartbeat_timestamp()
 
     # Event-driven: update company's latest AUM immediately post-ingest
-    try:
-        update_company_aum_post_ingest(conn, company_id=None, filing_id=new_filing_id)
-    except Exception as aum_err:
-        logger.error(
-            f"Error updating company AUM post-ingest for filing {new_filing_id}: {aum_err}"
+    if holdings_inserted:
+        try:
+            update_company_aum_post_ingest(conn, company_id=None, filing_id=new_filing_id)
+        except Exception as aum_err:
+            logger.error(
+                f"Error updating company AUM post-ingest for filing {new_filing_id}: {aum_err}"
+            )
+    else:
+        logger.warning(
+            f"No holdings extracted for filing {accession_number} (ID {new_filing_id}); skipping companies.aum update."
         )
 
     return True
@@ -234,8 +245,8 @@ def run_daily_index_sweep(
         return 0
     if not filing_date_str:
         today = dt.date.today()
-        yesterday = today - dt.timedelta(days=1)
-        filing_date_str = f"{yesterday.strftime('%Y-%m-%d')}:{today.strftime('%Y-%m-%d')}"
+        start_day = today - dt.timedelta(days=3)
+        filing_date_str = f"{start_day.strftime('%Y-%m-%d')}:{today.strftime('%Y-%m-%d')}"
 
     logger.info(f"Running bulk daily index sweep for filing_date={filing_date_str}...")
     filings = get_filings(form=VALID_FORMS, filing_date=filing_date_str)
@@ -243,11 +254,22 @@ def run_daily_index_sweep(
         logger.info(f"Bulk daily index sweep found 0 filings for {filing_date_str}.")
         return 0
 
-    ingested = 0
+    candidates = []
     for filing in filings:
-        update_heartbeat_timestamp()
         cik_str = normalize_cik(getattr(filing, "cik", ""))
-        if cik_str not in relevant_ciks:
+        if cik_str in relevant_ciks:
+            candidates.append((cik_str, filing))
+
+    existing_accessions = get_existing_accession_numbers(
+        conn,
+        [getattr(f, "accession_number", "") for _, f in candidates],
+    )
+
+    ingested = 0
+    for cik_str, filing in candidates:
+        update_heartbeat_timestamp()
+        acc = getattr(filing, "accession_number", "")
+        if acc in existing_accessions:
             continue
         try:
             if ingest_single_filing(conn, cik_str, filing):
@@ -257,7 +279,10 @@ def run_daily_index_sweep(
                 f"Failed ingesting filing during index sweep for CIK {cik_str}: {e}"
             )
 
-    logger.info(f"Bulk daily index sweep complete: ingested {ingested} new filings.")
+    logger.info(
+        f"Bulk daily index sweep complete: checked {len(candidates)} relevant filings "
+        f"({len(existing_accessions)} already in DB), ingested {ingested} new filings."
+    )
     return ingested
 
 
@@ -334,6 +359,7 @@ def main(conn, cik_queue: deque):
 
     base_ciks = [str(c).strip() for c in cik_queue if str(c).strip()]
     relevant_ciks = {normalize_cik(c) for c in base_ciks}
+    cleanup_empty_recent_filings(conn)
     cik_queue = deque(prioritize_ciks(conn, base_ciks))
     cycle_remaining = len(cik_queue)
     last_index_sweep_time = 0.0
@@ -391,6 +417,7 @@ def main(conn, cik_queue: deque):
         cik_queue.append(cik)
         cycle_remaining -= 1
         if cycle_remaining <= 0 and base_ciks:
+            cleanup_empty_recent_filings(conn)
             cik_queue = deque(prioritize_ciks(conn, base_ciks))
             cycle_remaining = len(cik_queue)
 
